@@ -129,8 +129,10 @@ pub async fn run(
     // --- State ---
     let mut fake_dns = FakeDns::new();
     let mut tcp_states: HashMap<SocketHandle, TcpForwardState> = HashMap::new();
-    // Track which (dst_ip, dst_port) pairs already have a listen socket.
-    let mut listening_endpoints: HashSet<(Ipv4Addr, u16)> = HashSet::new();
+    // Track which (src_ip, src_port, dst_ip, dst_port) 4-tuples already have a listen socket.
+    // This prevents duplicate sockets for SYN retransmits, while allowing
+    // multiple connections to the same dst_ip:dst_port (different src ports).
+    let mut listening_endpoints: HashSet<(Ipv4Addr, u16, Ipv4Addr, u16)> = HashSet::new();
 
     // Build the proxy connector.
     let _connector: Box<dyn ProxyConnector> = match config.proxy_type {
@@ -188,8 +190,9 @@ pub async fn run(
         {
             let queue = device.rx_queue();
             for pkt in queue.iter() {
-                if let Some((dst_ip, dst_port)) = parse_tcp_syn(pkt) {
-                    if !listening_endpoints.contains(&(dst_ip, dst_port)) {
+                if let Some((src_ip, src_port, dst_ip, dst_port)) = parse_tcp_syn(pkt) {
+                    let key = (src_ip, src_port, dst_ip, dst_port);
+                    if !listening_endpoints.contains(&key) {
                         tracing::debug!(
                             "SYN detected → {dst_ip}:{dst_port}, creating listen socket"
                         );
@@ -205,7 +208,7 @@ pub async fn run(
                         if sock.listen(listen_ep).is_ok() {
                             let handle = sockets.add(sock);
                             tcp_states.insert(handle, TcpForwardState::Listening);
-                            listening_endpoints.insert((dst_ip, dst_port));
+                            listening_endpoints.insert(key);
                         } else {
                             tracing::warn!("failed to listen on {dst_ip}:{dst_port}");
                         }
@@ -363,11 +366,14 @@ pub async fn run(
                     match (&mut jh).try_poll() {
                         Some(Ok(Ok(stream))) => {
                             tracing::debug!("proxy connection established for socket {handle}");
-                            tcp_states.insert(handle, TcpForwardState::Established(TcpForwardCtx {
-                                stream,
-                                proxy_to_app: Vec::new(),
-                                app_to_proxy: Vec::new(),
-                            }));
+                            tcp_states.insert(
+                                handle,
+                                TcpForwardState::Established(TcpForwardCtx {
+                                    stream,
+                                    proxy_to_app: Vec::new(),
+                                    app_to_proxy: Vec::new(),
+                                }),
+                            );
                         }
                         Some(Ok(Err(e))) => {
                             tracing::warn!("proxy connect failed: {e:#}");
@@ -439,7 +445,9 @@ pub async fn run(
                 } else if !ctx.app_to_proxy.is_empty() {
                     // Drain residual buffer from previous iterations
                     match ctx.stream.inner.try_write(&ctx.app_to_proxy) {
-                        Ok(n) => { ctx.app_to_proxy.drain(..n); }
+                        Ok(n) => {
+                            ctx.app_to_proxy.drain(..n);
+                        }
                         Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
                         Err(e) => {
                             tracing::debug!("proxy write error: {e}");
@@ -504,12 +512,6 @@ pub async fn run(
             for handle in closing_handles {
                 let sock = sockets.get::<tcp::Socket>(handle);
                 if sock.state() == tcp::State::Closed || sock.state() == tcp::State::TimeWait {
-                    // Get endpoint info before removing.
-                    let local_ep = sock.listen_endpoint();
-                    if let Some(addr) = local_ep.addr {
-                        let IpAddress::Ipv4(ip) = addr;
-                        listening_endpoints.remove(&(ip, local_ep.port));
-                    }
                     tcp_states.remove(&handle);
                     sockets.remove(handle);
                     tracing::debug!("cleaned up closed socket {handle}");

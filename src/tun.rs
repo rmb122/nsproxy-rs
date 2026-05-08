@@ -155,7 +155,8 @@ impl TxToken for TunTxToken {
 /// Parse a TCP SYN packet and return `(dst_ip, dst_port)`.
 ///
 /// Returns `None` if the packet is not an IPv4 TCP SYN (without ACK).
-pub fn parse_tcp_syn(packet: &[u8]) -> Option<(Ipv4Addr, u16)> {
+/// Returns (src_ip, src_port, dst_ip, dst_port).
+pub fn parse_tcp_syn(packet: &[u8]) -> Option<(Ipv4Addr, u16, Ipv4Addr, u16)> {
     if packet.len() < 40 {
         return None;
     } // min IP(20) + TCP(20)
@@ -177,9 +178,11 @@ pub fn parse_tcp_syn(packet: &[u8]) -> Option<(Ipv4Addr, u16)> {
     if !is_syn {
         return None;
     }
+    let src_ip = Ipv4Addr::new(packet[12], packet[13], packet[14], packet[15]);
+    let src_port = u16::from_be_bytes([packet[tcp_offset], packet[tcp_offset + 1]]);
     let dst_ip = Ipv4Addr::new(packet[16], packet[17], packet[18], packet[19]);
     let dst_port = u16::from_be_bytes([packet[tcp_offset + 2], packet[tcp_offset + 3]]);
-    Some((dst_ip, dst_port))
+    Some((src_ip, src_port, dst_ip, dst_port))
 }
 
 /// Parse an IPv4 UDP packet and return `(dst_ip, dst_port)`.
