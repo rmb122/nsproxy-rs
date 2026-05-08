@@ -22,28 +22,17 @@ use config::{Config, ProxyType};
 
 /// nsproxy-rs — run a command inside a dedicated network namespace whose traffic
 /// is transparently proxied.
+///
+/// Examples:
+///   nsproxy-rs curl http://example.com
+///   nsproxy-rs -x socks5://127.0.0.1:1080 curl http://example.com
+///   nsproxy-rs -x http://user:pass@proxy.example.com:8080 wget example.com
 #[derive(Parser, Debug)]
 #[command(author, version, about, long_about = None)]
 struct Cli {
-    /// Use HTTP CONNECT proxy (default: SOCKS5)
-    #[arg(short = 'H', long = "http", conflicts_with = "socks5")]
-    http: bool,
-
-    /// Use SOCKS5 proxy (default)
-    #[arg(short = 'S', long = "socks5")]
-    socks5: bool,
-
-    /// Proxy server hostname or IP
-    #[arg(short = 's', long = "server", default_value = "127.0.0.1")]
-    server: String,
-
-    /// Proxy server port
-    #[arg(short = 'p', long = "port", default_value_t = 1080)]
-    port: u16,
-
-    /// Proxy authentication as user:password
-    #[arg(short = 'a', long = "auth")]
-    auth: Option<String>,
+    /// Proxy URL: socks5://[user:pass@]host:port or http://[user:pass@]host:port
+    #[arg(short = 'x', long = "proxy", default_value = "socks5://127.0.0.1:1080")]
+    proxy: String,
 
     /// Increase verbosity (may be repeated)
     #[arg(short = 'v', long = "verbose", action = clap::ArgAction::Count)]
@@ -54,8 +43,44 @@ struct Cli {
     quiet: u8,
 
     /// Command to run inside the namespace (and its arguments)
-    #[arg(last = true, required = true)]
+    #[arg(trailing_var_arg = true, required = true)]
     command: Vec<String>,
+}
+
+/// Parse a proxy URL like "socks5://user:pass@host:port" into Config fields.
+fn parse_proxy_url(url: &str) -> Result<(ProxyType, std::net::SocketAddr, Option<(String, String)>)> {
+    // Determine scheme
+    let (proxy_type, rest) = if let Some(rest) = url.strip_prefix("socks5://") {
+        (ProxyType::Socks5, rest)
+    } else if let Some(rest) = url.strip_prefix("socks://") {
+        (ProxyType::Socks5, rest)
+    } else if let Some(rest) = url.strip_prefix("http://") {
+        (ProxyType::Http, rest)
+    } else {
+        bail!("unsupported proxy scheme in '{}'. Use socks5:// or http://", url);
+    };
+
+    // Split auth from host:port
+    let (auth, host_port) = if let Some(at_pos) = rest.rfind('@') {
+        let auth_str = &rest[..at_pos];
+        let hp = &rest[at_pos + 1..];
+        let mut parts = auth_str.splitn(2, ':');
+        let user = parts.next().unwrap_or("").to_string();
+        let pass = parts.next().unwrap_or("").to_string();
+        if user.is_empty() {
+            bail!("empty username in proxy URL");
+        }
+        (Some((user, pass)), hp)
+    } else {
+        (None, rest)
+    };
+
+    // Parse host:port
+    let addr: std::net::SocketAddr = host_port
+        .parse()
+        .with_context(|| format!("invalid proxy address: '{}'", host_port))?;
+
+    Ok((proxy_type, addr, auth))
 }
 
 // ── Entry point ───────────────────────────────────────────────────────────────
@@ -82,22 +107,7 @@ fn main() -> Result<()> {
     let _ = env_logger::try_init();
 
     // --- build Config --------------------------------------------------------
-    let proxy_type = if cli.http {
-        ProxyType::Http
-    } else {
-        ProxyType::Socks5
-    };
-
-    let proxy_addr: std::net::SocketAddr = format!("{}:{}", cli.server, cli.port)
-        .parse()
-        .with_context(|| format!("parse proxy address {}:{}", cli.server, cli.port))?;
-
-    let proxy_auth = cli.auth.as_deref().and_then(|s| {
-        let mut parts = s.splitn(2, ':');
-        let user = parts.next()?.to_string();
-        let pass = parts.next()?.to_string();
-        Some((user, pass))
-    });
+    let (proxy_type, proxy_addr, proxy_auth) = parse_proxy_url(&cli.proxy)?;
 
     let config = Config {
         proxy_type,
