@@ -63,8 +63,6 @@ struct TcpForwardCtx {
     stream: ProxyStream,
     /// Data read from proxy, waiting to be written to smoltcp socket.
     proxy_to_app: Vec<u8>,
-    /// Data read from smoltcp socket, waiting to be written to proxy.
-    app_to_proxy: Vec<u8>,
 }
 
 // ── Public entry point ───────────────────────────────────────────────────────
@@ -374,7 +372,6 @@ pub async fn run(
                                 TcpForwardState::Established(TcpForwardCtx {
                                     stream,
                                     proxy_to_app: Vec::new(),
-                                    app_to_proxy: Vec::new(),
                                 }),
                             );
                         }
@@ -424,39 +421,35 @@ pub async fn run(
                 let sock = sockets.get_mut::<tcp::Socket>(handle);
 
                 // --- App → Proxy direction ---
-                // Use peek to look at data without consuming, then only drain what we write.
-                if ctx.app_to_proxy.is_empty() && sock.may_recv() {
-                    // Try to peek at available data in smoltcp rx buffer
-                    match sock.peek_slice(&mut tmp_buf) {
-                        Ok(n) if n > 0 => {
-                            match ctx.stream.inner.try_write(&tmp_buf[..n]) {
-                                Ok(written) => {
-                                    // Actually consume only what we wrote
-                                    sock.recv(|_| (written, ())).ok();
-                                }
-                                Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                                    // proxy not writable yet, leave data in smoltcp buffer
-                                }
-                                Err(e) => {
-                                    tracing::debug!("proxy write error: {e}");
-                                    sock.close();
-                                }
-                            }
+                // Read from smoltcp rx buffer and write to proxy.
+                // Use recv() callback which gives us only one contiguous slice
+                // (safe with ring buffer), and consume only what we successfully wrote.
+                let mut app_to_proxy_err = false;
+                if sock.may_recv() && sock.can_recv() {
+                    let stream_inner = &ctx.stream.inner;
+                    let result = sock.recv(|data| {
+                        if data.is_empty() {
+                            return (0, Ok(0));
                         }
+                        match stream_inner.try_write(data) {
+                            Ok(written) => (written, Ok(written)),
+                            Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                                (0, Ok(0))
+                            }
+                            Err(e) => (0, Err(e)),
+                        }
+                    });
+                    match result {
+                        Ok(Err(e)) => {
+                            tracing::debug!("proxy write error: {e}");
+                            app_to_proxy_err = true;
+                        }
+                        Err(_) => {} // RecvError - socket not in a state to recv
                         _ => {}
                     }
-                } else if !ctx.app_to_proxy.is_empty() {
-                    // Drain residual buffer from previous iterations
-                    match ctx.stream.inner.try_write(&ctx.app_to_proxy) {
-                        Ok(n) => {
-                            ctx.app_to_proxy.drain(..n);
-                        }
-                        Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
-                        Err(e) => {
-                            tracing::debug!("proxy write error: {e}");
-                            sock.close();
-                        }
-                    }
+                }
+                if app_to_proxy_err {
+                    sock.close();
                 }
 
                 // --- Proxy → App direction ---
