@@ -4,8 +4,8 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-tokio = { version = "1", features = ["rt-multi-thread", "net", "io-util", "macros", "sync", "signal"] }
-smoltcp = { version = "0.12", default-features = false, features = ["medium-ip", "proto-ipv4", "socket-tcp", "socket-udp"] }
+tokio = { version = "1", features = ["rt-multi-thread", "net", "io-util", "macros", "sync", "signal", "time"] }
+smoltcp = { version = "0.12", default-features = false, features = ["std", "medium-ip", "proto-ipv4", "socket-tcp", "socket-udp", "alloc"] }
 nix = { version = "0.29", features = ["sched", "mount", "ioctl", "socket", "user", "net", "fs", "signal", "process"] }
 clap = { version = "4", features = ["derive"] }
 tracing = "0.1"

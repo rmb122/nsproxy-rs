@@ -1,8 +1,10 @@
 mod config;
+mod event_loop;
 mod fake_dns;
 mod fd_passing;
 mod namespace;
 mod proxy;
+mod tun;
 
 use std::ffi::CString;
 use std::os::unix::io::{AsRawFd, BorrowedFd, RawFd};
@@ -10,7 +12,7 @@ use std::os::unix::io::{AsRawFd, BorrowedFd, RawFd};
 use anyhow::{bail, Context, Result};
 use clap::Parser;
 use nix::sys::socket::{AddressFamily, SockFlag, SockType, socketpair};
-use nix::sys::wait::waitpid;
+use nix::sys::wait::{WaitStatus, waitpid};
 use nix::unistd::{ForkResult, close, execvp, fork, read, write};
 use tracing::Level;
 
@@ -203,7 +205,7 @@ fn exec_command(command: &[String]) -> Result<()> {
 fn parent_main(
     sock: RawFd,
     child: nix::unistd::Pid,
-    _config: Config,
+    config: Config,
 ) -> Result<()> {
     tracing::debug!("parent: waiting for TUN fd from child");
 
@@ -218,13 +220,77 @@ fn parent_main(
     write(sock_bfd, &[1u8]).context("write ready signal")?;
     tracing::debug!("parent: sent ready signal to child");
 
-    // TODO: start tokio event loop here (Tasks 5+)
-    // For now, just wait for the child to exit.
-    tracing::debug!("parent: waiting for child pid={child}");
-    let status = waitpid(child, None).context("waitpid")?;
-    tracing::info!("parent: child exited with status {status:?}");
+    // 3. Build tokio runtime and run the event loop.
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .context("build tokio runtime")?;
 
-    // Close the TUN fd — in later tasks this will be managed by the event loop.
+    rt.block_on(async move {
+        // Shutdown channel: event loop stops when we signal true.
+        let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+
+        // Spawn the event loop.
+        let event_loop_handle = tokio::spawn(event_loop::run(tun_fd, config, shutdown_rx));
+
+        // Wait for child to exit (in a blocking fashion on a separate thread).
+        let child_pid = child;
+        let child_wait = tokio::task::spawn_blocking(move || -> Result<()> {
+            loop {
+                match waitpid(child_pid, None) {
+                    Ok(WaitStatus::Exited(_, code)) => {
+                        tracing::info!("parent: child exited with code {code}");
+                        return Ok(());
+                    }
+                    Ok(WaitStatus::Signaled(_, sig, _)) => {
+                        tracing::info!("parent: child killed by signal {sig}");
+                        return Ok(());
+                    }
+                    Ok(status) => {
+                        tracing::debug!("parent: child status {status:?}, continuing wait");
+                        continue;
+                    }
+                    Err(nix::errno::Errno::EINTR) => continue,
+                    Err(e) => {
+                        return Err(anyhow::anyhow!("waitpid: {e}"));
+                    }
+                }
+            }
+        });
+
+        // Wait for child exit.
+        if let Err(e) = child_wait.await {
+            tracing::warn!("child wait task failed: {e}");
+        }
+
+        // Signal the event loop to shut down.
+        let _ = shutdown_tx.send(true);
+
+        // Wait for event loop to finish (with a timeout).
+        match tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            event_loop_handle,
+        )
+        .await
+        {
+            Ok(Ok(Ok(()))) => {
+                tracing::debug!("event loop exited cleanly");
+            }
+            Ok(Ok(Err(e))) => {
+                tracing::warn!("event loop error: {e:#}");
+            }
+            Ok(Err(e)) => {
+                tracing::warn!("event loop task panicked: {e}");
+            }
+            Err(_) => {
+                tracing::warn!("event loop did not exit within timeout");
+            }
+        }
+
+        Ok::<(), anyhow::Error>(())
+    })?;
+
+    // Close the TUN fd and socket.
     let _ = close(tun_fd);
     let _ = close(sock);
 
