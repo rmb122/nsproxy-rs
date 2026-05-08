@@ -72,21 +72,30 @@ pub fn create_namespace() -> Result<()> {
             let uid = getuid();
             let gid = getgid();
 
-            // Write uid_map: "0 <real_uid> 1"
+            // Deny setgroups before writing uid_map/gid_map (kernel requirement)
+            // Use OpenOptions to append (not truncate) like the original C code
+            use std::fs::OpenOptions;
+            use std::io::Write;
+
+            let mut f = OpenOptions::new()
+                .write(true)
+                .open("/proc/self/setgroups")
+                .context("open /proc/self/setgroups")?;
+            f.write_all(b"deny")
+                .context("write /proc/self/setgroups")?;
+            drop(f);
+
+            // Write uid_map: "<uid> <uid> 1" (map real uid to itself)
             fs::write(
                 "/proc/self/uid_map",
-                format!("0 {} 1\n", uid),
+                format!("{} {} 1\n", uid, uid),
             )
             .context("write /proc/self/uid_map")?;
 
-            // Deny setgroups before writing gid_map (kernel requirement)
-            fs::write("/proc/self/setgroups", "deny")
-                .context("write /proc/self/setgroups")?;
-
-            // Write gid_map: "0 <real_gid> 1"
+            // Write gid_map: "<gid> <gid> 1"
             fs::write(
                 "/proc/self/gid_map",
-                format!("0 {} 1\n", gid),
+                format!("{} {} 1\n", gid, gid),
             )
             .context("write /proc/self/gid_map")?;
 
