@@ -1,4 +1,5 @@
 mod config;
+mod fake_dns;
 mod fd_passing;
 mod namespace;
 mod proxy;
