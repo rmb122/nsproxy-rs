@@ -390,8 +390,33 @@ pub async fn run(
                             tcp_states.insert(handle, TcpForwardState::Closing);
                         }
                         None => {
-                            // Still in progress, put it back.
-                            tcp_states.insert(handle, TcpForwardState::Connecting(jh));
+                            // Proxy connect still in progress. If the client
+                            // meanwhile reset / closed the smoltcp socket,
+                            // there's no one left to hand the stream to —
+                            // abort the task so it doesn't linger (e.g. a
+                            // hung proxy connect waiting on Linux TCP timeout
+                            // would otherwise stay pending for minutes).
+                            let sock = sockets.get::<tcp::Socket>(handle);
+                            let client_gone = matches!(
+                                sock.state(),
+                                tcp::State::Closed
+                                    | tcp::State::Closing
+                                    | tcp::State::TimeWait
+                                    | tcp::State::FinWait1
+                                    | tcp::State::FinWait2
+                                    | tcp::State::LastAck
+                            );
+                            if client_gone {
+                                tracing::debug!(
+                                    "client gone while proxy connecting (socket {handle}, state {:?}); aborting connect",
+                                    sock.state()
+                                );
+                                jh.abort();
+                                tcp_states.insert(handle, TcpForwardState::Closing);
+                            } else {
+                                // Still in progress, put it back.
+                                tcp_states.insert(handle, TcpForwardState::Connecting(jh));
+                            }
                         }
                     }
                 }
@@ -524,6 +549,14 @@ pub async fn run(
 
         // Run poll_egress to send any pending responses.
         iface.poll(SmolInstant::now(), &mut device, &mut sockets);
+    }
+
+    // Abort any in-flight proxy connect tasks so they don't linger past
+    // event-loop shutdown. Dropping a JoinHandle does NOT cancel the task.
+    for (_, state) in tcp_states.drain() {
+        if let TcpForwardState::Connecting(jh) = state {
+            jh.abort();
+        }
     }
 
     Ok(())

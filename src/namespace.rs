@@ -152,6 +152,18 @@ pub fn setup_mount_namespace() -> Result<()> {
     Ok(())
 }
 
+/// RAII guard that unlinks a path when dropped. Used to ensure temp files are
+/// cleaned up on every early-return path, whether or not the bind-mount
+/// succeeded. (After a successful bind-mount, unlinking the source path is
+/// harmless — the kernel keeps the inode alive via the mount reference.)
+struct UnlinkOnDrop(std::path::PathBuf);
+
+impl Drop for UnlinkOnDrop {
+    fn drop(&mut self) {
+        let _ = nix::unistd::unlink(&self.0);
+    }
+}
+
 /// Create a temporary file with random name, write `content`, bind-mount over
 /// `target`, then unlink the temp file (mount keeps inode alive).
 fn bind_mount_tmpfile(content: &str, target: &str) -> Result<()> {
@@ -160,6 +172,11 @@ fn bind_mount_tmpfile(content: &str, target: &str) -> Result<()> {
 
     // nix::unistd::mkstemp creates a temp file and returns (RawFd, PathBuf)
     let (fd, path) = nix::unistd::mkstemp("/tmp/nsproxy-XXXXXX").context("mkstemp")?;
+
+    // Guard ensures the on-disk path is unlinked on every exit path (success,
+    // write error, mount error, utf-8 error, ...). After bind_mount, the
+    // inode survives because the mount itself references it.
+    let _guard = UnlinkOnDrop(path.clone());
 
     // SAFETY: mkstemp returns a valid, exclusively-owned fd
     let mut file = unsafe { std::fs::File::from_raw_fd(fd) };
@@ -177,9 +194,6 @@ fn bind_mount_tmpfile(content: &str, target: &str) -> Result<()> {
         None::<&str>,
     )
     .with_context(|| format!("bind-mount {:?} → {}", path, target))?;
-
-    // Unlink — mount keeps inode alive, no leftover file on disk
-    let _ = nix::unistd::unlink(&path);
 
     Ok(())
 }
