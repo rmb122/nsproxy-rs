@@ -133,6 +133,17 @@ pub fn setup_mount_namespace() -> Result<()> {
     bind_mount_tmpfile("hosts: files dns\n", "/etc/nsswitch.conf")
         .context("bind-mount nsswitch.conf")?;
 
+    // WORKAROUND: ssh complains about "Bad owner or permissions" on config files
+    // because inside the user namespace, file owners map to nobody (65534).
+    // Mount a tmpfs over ssh_config.d to hide the problematic files.
+    let _ = nix::mount::mount(
+        Some("tmpfs"),
+        "/etc/ssh/ssh_config.d",
+        Some("tmpfs"),
+        nix::mount::MsFlags::empty(),
+        None::<&str>,
+    );
+
     tracing::debug!("mount namespace set up; DNS → 172.23.255.254");
     Ok(())
 }
