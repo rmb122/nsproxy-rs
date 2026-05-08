@@ -125,34 +125,48 @@ pub fn setup_mount_namespace() -> Result<()> {
     )
     .context("make root mount private")?;
 
-    // Write and bind-mount custom resolv.conf
-    let tmp_resolv = "/tmp/nsproxy-resolv.conf";
-    fs::write(tmp_resolv, "nameserver 172.23.255.254\n").context("write temp resolv.conf")?;
+    // Create temp files with random names, bind-mount them, then unlink.
+    // The mount keeps the inode alive even after unlink (no leftover files).
+    bind_mount_tmpfile("nameserver 172.23.255.254\n", "/etc/resolv.conf")
+        .context("bind-mount resolv.conf")?;
 
-    nix::mount::mount(
-        Some(tmp_resolv),
-        "/etc/resolv.conf",
-        None::<&str>,
-        nix::mount::MsFlags::MS_BIND,
-        None::<&str>,
-    )
-    .context("bind-mount resolv.conf")?;
-
-    // Write and bind-mount custom nsswitch.conf to force plain DNS
-    // (bypass systemd-resolved, mymachines, mdns, etc.)
-    let tmp_nsswitch = "/tmp/nsproxy-nsswitch.conf";
-    fs::write(tmp_nsswitch, "hosts: files dns\n").context("write temp nsswitch.conf")?;
-
-    nix::mount::mount(
-        Some(tmp_nsswitch),
-        "/etc/nsswitch.conf",
-        None::<&str>,
-        nix::mount::MsFlags::MS_BIND,
-        None::<&str>,
-    )
-    .context("bind-mount nsswitch.conf")?;
+    bind_mount_tmpfile("hosts: files dns\n", "/etc/nsswitch.conf")
+        .context("bind-mount nsswitch.conf")?;
 
     tracing::debug!("mount namespace set up; DNS → 172.23.255.254");
+    Ok(())
+}
+
+/// Create a temporary file with random name, write `content`, bind-mount over
+/// `target`, then unlink the temp file (mount keeps inode alive).
+fn bind_mount_tmpfile(content: &str, target: &str) -> Result<()> {
+    use std::io::Write;
+    use std::os::unix::io::FromRawFd;
+
+    // nix::unistd::mkstemp creates a temp file and returns (RawFd, PathBuf)
+    let (fd, path) = nix::unistd::mkstemp("/tmp/nsproxy-XXXXXX")
+        .context("mkstemp")?;
+
+    // SAFETY: mkstemp returns a valid, exclusively-owned fd
+    let mut file = unsafe { std::fs::File::from_raw_fd(fd) };
+    file.write_all(content.as_bytes())
+        .with_context(|| format!("write {:?}", path))?;
+    drop(file);
+
+    // Bind-mount
+    let path_str = path.to_str().context("temp path not utf8")?;
+    nix::mount::mount(
+        Some(path_str),
+        target,
+        None::<&str>,
+        nix::mount::MsFlags::MS_BIND,
+        None::<&str>,
+    )
+    .with_context(|| format!("bind-mount {:?} → {}", path, target))?;
+
+    // Unlink — mount keeps inode alive, no leftover file on disk
+    let _ = nix::unistd::unlink(&path);
+
     Ok(())
 }
 
