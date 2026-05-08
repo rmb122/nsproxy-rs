@@ -133,6 +133,8 @@ pub async fn run(
     // This prevents duplicate sockets for SYN retransmits, while allowing
     // multiple connections to the same dst_ip:dst_port (different src ports).
     let mut listening_endpoints: HashSet<(Ipv4Addr, u16, Ipv4Addr, u16)> = HashSet::new();
+    // Reverse map: socket handle → 4-tuple, for cleanup
+    let mut handle_to_endpoint: HashMap<SocketHandle, (Ipv4Addr, u16, Ipv4Addr, u16)> = HashMap::new();
 
     // Build the proxy connector.
     let _connector: Box<dyn ProxyConnector> = match config.proxy_type {
@@ -209,6 +211,7 @@ pub async fn run(
                             let handle = sockets.add(sock);
                             tcp_states.insert(handle, TcpForwardState::Listening);
                             listening_endpoints.insert(key);
+                            handle_to_endpoint.insert(handle, key);
                         } else {
                             tracing::warn!("failed to listen on {dst_ip}:{dst_port}");
                         }
@@ -478,13 +481,18 @@ pub async fn run(
                 }
                 // 2. Drain proxy_to_app buffer into smoltcp socket
                 if !ctx.proxy_to_app.is_empty() && sock.can_send() {
-                    match sock.send_slice(&ctx.proxy_to_app) {
-                        Ok(n) => {
-                            ctx.proxy_to_app.drain(..n);
-                        }
-                        Err(_) => {
-                            tracing::debug!("smoltcp send error for socket {handle}");
-                            sock.close();
+                    // Only write up to the free space in smoltcp's tx buffer
+                    let free_space = TCP_BUF_SIZE.saturating_sub(sock.send_queue());
+                    let send_len = free_space.min(ctx.proxy_to_app.len());
+                    if send_len > 0 {
+                        match sock.send_slice(&ctx.proxy_to_app[..send_len]) {
+                            Ok(n) => {
+                                ctx.proxy_to_app.drain(..n);
+                            }
+                            Err(_) => {
+                                tracing::debug!("smoltcp send error for socket {handle}");
+                                sock.close();
+                            }
                         }
                     }
                 }
@@ -512,6 +520,9 @@ pub async fn run(
             for handle in closing_handles {
                 let sock = sockets.get::<tcp::Socket>(handle);
                 if sock.state() == tcp::State::Closed || sock.state() == tcp::State::TimeWait {
+                    if let Some(key) = handle_to_endpoint.remove(&handle) {
+                        listening_endpoints.remove(&key);
+                    }
                     tcp_states.remove(&handle);
                     sockets.remove(handle);
                     tracing::debug!("cleaned up closed socket {handle}");
