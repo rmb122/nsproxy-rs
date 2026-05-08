@@ -52,50 +52,60 @@ fn ifreq_for(name: &str) -> Ifreq {
 
 // ── Network namespace ─────────────────────────────────────────────────────────
 
-/// Enter a new network namespace.
+/// Enter a new network namespace (child side).
 ///
-/// First tries `CLONE_NEWNET` alone (requires `CAP_SYS_ADMIN`).  If that fails
-/// (e.g. running as an unprivileged user), falls back to creating a user
-/// namespace first (`CLONE_NEWUSER | CLONE_NEWNET`) and writes uid/gid maps so
-/// that root inside the namespace maps to the real uid/gid outside.
-pub fn create_namespace() -> Result<()> {
+/// First tries `CLONE_NEWNET` alone (requires `CAP_SYS_ADMIN`).  If that fails,
+/// falls back to `CLONE_NEWUSER | CLONE_NEWNET`.
+///
+/// Returns `true` if a user namespace was created (parent must write uid/gid maps).
+pub fn create_namespace() -> Result<bool> {
     match unshare(CloneFlags::CLONE_NEWNET) {
         Ok(()) => {
-            tracing::debug!("unshare(CLONE_NEWNET) succeeded");
-            Ok(())
+            tracing::debug!("unshare(CLONE_NEWNET) succeeded (privileged)");
+            Ok(false)
         }
         Err(e) => {
             tracing::debug!("unshare(CLONE_NEWNET) failed ({e}), trying user+net namespace");
             unshare(CloneFlags::CLONE_NEWUSER | CloneFlags::CLONE_NEWNET)
                 .context("unshare(CLONE_NEWUSER|CLONE_NEWNET)")?;
-
-            let uid = getuid();
-            let gid = getgid();
-
-            // Deny setgroups before writing uid_map/gid_map (kernel requirement)
-            // Use OpenOptions to append (not truncate) like the original C code
-            use std::fs::OpenOptions;
-            use std::io::Write;
-
-            let mut f = OpenOptions::new()
-                .write(true)
-                .open("/proc/self/setgroups")
-                .context("open /proc/self/setgroups")?;
-            f.write_all(b"deny").context("write /proc/self/setgroups")?;
-            drop(f);
-
-            // Write uid_map: "<uid> <uid> 1" (map real uid to itself)
-            fs::write("/proc/self/uid_map", format!("{} {} 1\n", uid, uid))
-                .context("write /proc/self/uid_map")?;
-
-            // Write gid_map: "<gid> <gid> 1"
-            fs::write("/proc/self/gid_map", format!("{} {} 1\n", gid, gid))
-                .context("write /proc/self/gid_map")?;
-
-            tracing::debug!("user+net namespace created (uid={uid}, gid={gid})");
-            Ok(())
+            tracing::debug!("unshare(CLONE_NEWUSER|CLONE_NEWNET) succeeded");
+            Ok(true) // parent needs to write maps
         }
     }
+}
+
+/// Write uid/gid maps for a child process from the PARENT side.
+/// This avoids AppArmor restrictions on /proc/self/* writes after unshare.
+pub fn write_id_maps(child_pid: u32, uid: u32, gid: u32) -> Result<()> {
+    use std::fs::OpenOptions;
+    use std::io::Write;
+
+    fn proc_write(path: &str, data: &str) -> Result<()> {
+        let mut f = OpenOptions::new()
+            .write(true)
+            .open(path)
+            .with_context(|| format!("open {}", path))?;
+        f.write_all(data.as_bytes())
+            .with_context(|| format!("write {}", path))?;
+        Ok(())
+    }
+
+    let setgroups_path = format!("/proc/{}/setgroups", child_pid);
+    let uid_map_path = format!("/proc/{}/uid_map", child_pid);
+    let gid_map_path = format!("/proc/{}/gid_map", child_pid);
+
+    // Deny setgroups (required before gid_map write)
+    proc_write(&setgroups_path, "deny")?;
+
+    // Write uid_map: "0 <real_uid> 1" — map root inside to real uid outside
+    // This gives the process full capabilities inside the namespace
+    proc_write(&uid_map_path, &format!("0 {} 1\n", uid))?;
+
+    // Write gid_map: "0 <real_gid> 1"
+    proc_write(&gid_map_path, &format!("0 {} 1\n", gid))?;
+
+    tracing::debug!("wrote id maps for pid {} (uid={}, gid={})", child_pid, uid, gid);
+    Ok(())
 }
 
 // ── Mount namespace + resolv.conf ────────────────────────────────────────────
@@ -127,7 +137,37 @@ pub fn setup_mount_namespace() -> Result<()> {
 
 /// Bring up the loopback interface inside the new network namespace.
 pub fn bringup_loopback() -> Result<()> {
-    run_cmd("ip", &["link", "set", "lo", "up"]).context("bring up loopback")?;
+    unsafe {
+        let sock = libc::socket(libc::AF_INET, libc::SOCK_DGRAM | libc::SOCK_CLOEXEC, 0);
+        if sock < 0 {
+            anyhow::bail!("socket() for loopback: {}", std::io::Error::last_os_error());
+        }
+
+        let mut ifr: libc::ifreq = std::mem::zeroed();
+        let name = b"lo\0";
+        std::ptr::copy_nonoverlapping(name.as_ptr(), ifr.ifr_name.as_mut_ptr() as *mut u8, name.len());
+        ifr.ifr_ifru.ifru_flags = (libc::IFF_UP | libc::IFF_RUNNING) as i16;
+
+        if libc::ioctl(sock, libc::SIOCSIFFLAGS as _, &ifr as *const _) < 0 {
+            let err = std::io::Error::last_os_error();
+            libc::close(sock);
+            if err.raw_os_error() == Some(libc::EPERM) {
+                anyhow::bail!(
+                    "ioctl SIOCSIFFLAGS lo: {}\n\
+                     hint: If you are using Ubuntu >= 23.10, run:\n\
+                     \n\
+                       sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0\n\
+                     \n\
+                     Or add to /etc/sysctl.d/70-apparmor-userns.conf:\n\
+                       kernel.apparmor_restrict_unprivileged_userns=0\n\
+                     then: sudo sysctl -p /etc/sysctl.d/70-apparmor-userns.conf",
+                    err
+                );
+            }
+            anyhow::bail!("ioctl SIOCSIFFLAGS lo: {}", err);
+        }
+        libc::close(sock);
+    }
     tracing::debug!("loopback up");
     Ok(())
 }
@@ -169,15 +209,78 @@ pub fn create_tun() -> Result<RawFd> {
 
     tracing::debug!("tun0 created (fd={fd})");
 
-    // Assign IP address and bring the interface up
-    run_cmd("ip", &["addr", "add", "172.23.255.255/31", "dev", "tun0"])
-        .context("ip addr add tun0")?;
+    // Configure tun0 using ioctls (ip command uses RTNETLINK which may fail in user ns)
+    unsafe {
+        let sock = libc::socket(libc::AF_INET, libc::SOCK_DGRAM | libc::SOCK_CLOEXEC, 0);
+        if sock < 0 {
+            libc::close(fd);
+            anyhow::bail!("socket() for tun config: {}", std::io::Error::last_os_error());
+        }
 
-    run_cmd("ip", &["link", "set", "tun0", "mtu", "65000", "up"]).context("ip link set tun0 up")?;
+        let mut ifr: libc::ifreq = std::mem::zeroed();
+        let name = b"tun0\0";
+        std::ptr::copy_nonoverlapping(name.as_ptr(), ifr.ifr_name.as_mut_ptr() as *mut u8, name.len());
 
-    // Default route through the virtual gateway
-    run_cmd("ip", &["route", "add", "default", "via", "172.23.255.254"])
-        .context("ip route add default")?;
+        // Set MTU
+        ifr.ifr_ifru.ifru_mtu = 65000;
+        if libc::ioctl(sock, libc::SIOCSIFMTU as _, &ifr as *const _) < 0 {
+            libc::close(sock); libc::close(fd);
+            anyhow::bail!("ioctl SIOCSIFMTU: {}", std::io::Error::last_os_error());
+        }
+
+        // Set IP address: 172.23.255.255
+        let mut addr_ifr: libc::ifreq = std::mem::zeroed();
+        std::ptr::copy_nonoverlapping(name.as_ptr(), addr_ifr.ifr_name.as_mut_ptr() as *mut u8, name.len());
+        let sin = &mut addr_ifr.ifr_ifru.ifru_addr as *mut libc::sockaddr as *mut libc::sockaddr_in;
+        (*sin).sin_family = libc::AF_INET as u16;
+        (*sin).sin_addr.s_addr = u32::from_be_bytes([172, 23, 255, 255]).to_be();
+        if libc::ioctl(sock, libc::SIOCSIFADDR as _, &addr_ifr as *const _) < 0 {
+            libc::close(sock); libc::close(fd);
+            anyhow::bail!("ioctl SIOCSIFADDR: {}", std::io::Error::last_os_error());
+        }
+
+        // Set netmask: 255.255.255.254 (/31)
+        let mut mask_ifr: libc::ifreq = std::mem::zeroed();
+        std::ptr::copy_nonoverlapping(name.as_ptr(), mask_ifr.ifr_name.as_mut_ptr() as *mut u8, name.len());
+        let sin = &mut mask_ifr.ifr_ifru.ifru_addr as *mut libc::sockaddr as *mut libc::sockaddr_in;
+        (*sin).sin_family = libc::AF_INET as u16;
+        (*sin).sin_addr.s_addr = u32::from_be_bytes([255, 255, 255, 254]).to_be();
+        if libc::ioctl(sock, libc::SIOCSIFNETMASK as _, &mask_ifr as *const _) < 0 {
+            libc::close(sock); libc::close(fd);
+            anyhow::bail!("ioctl SIOCSIFNETMASK: {}", std::io::Error::last_os_error());
+        }
+
+        // Bring up tun0
+        ifr.ifr_ifru.ifru_flags = (libc::IFF_UP | libc::IFF_RUNNING) as i16;
+        if libc::ioctl(sock, libc::SIOCSIFFLAGS as _, &ifr as *const _) < 0 {
+            libc::close(sock); libc::close(fd);
+            anyhow::bail!("ioctl SIOCSIFFLAGS tun0 UP: {}", std::io::Error::last_os_error());
+        }
+
+        // Add default route via 172.23.255.254
+        let mut route: libc::rtentry = std::mem::zeroed();
+        let dst = &mut route.rt_dst as *mut libc::sockaddr as *mut libc::sockaddr_in;
+        (*dst).sin_family = libc::AF_INET as u16;
+        (*dst).sin_addr.s_addr = 0; // 0.0.0.0
+
+        let gw = &mut route.rt_gateway as *mut libc::sockaddr as *mut libc::sockaddr_in;
+        (*gw).sin_family = libc::AF_INET as u16;
+        (*gw).sin_addr.s_addr = u32::from_be_bytes([172, 23, 255, 254]).to_be();
+
+        let mask = &mut route.rt_genmask as *mut libc::sockaddr as *mut libc::sockaddr_in;
+        (*mask).sin_family = libc::AF_INET as u16;
+        (*mask).sin_addr.s_addr = 0; // 0.0.0.0
+
+        route.rt_flags = (libc::RTF_UP | libc::RTF_GATEWAY) as u16;
+        route.rt_dev = name.as_ptr() as *mut i8;
+
+        if libc::ioctl(sock, libc::SIOCADDRT as _, &route as *const _) < 0 {
+            libc::close(sock); libc::close(fd);
+            anyhow::bail!("ioctl SIOCADDRT: {}", std::io::Error::last_os_error());
+        }
+
+        libc::close(sock);
+    }
 
     tracing::debug!("tun0 configured: 172.23.255.255/31, mtu 65000, gw 172.23.255.254");
     Ok(fd)

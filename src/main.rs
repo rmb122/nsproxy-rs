@@ -131,7 +131,10 @@ fn main() -> Result<()> {
             // Drop the parent-side socket.
             drop(parent_sock);
 
-            child_main(child_sock_fd, &config).expect("child_main failed");
+            if let Err(e) = child_main(child_sock_fd, &config) {
+                eprintln!("nsproxy-rs: {:#}", e);
+                std::process::exit(1);
+            }
 
             // Unreachable after execvp, but keeps the type-checker happy.
             std::process::exit(1);
@@ -154,34 +157,44 @@ fn child_main(sock: RawFd, config: &Config) -> Result<()> {
     tracing::debug!("child: setting up namespace");
 
     // 1. Enter a new network namespace (with user-ns fallback for non-root).
-    namespace::create_namespace().context("create_namespace")?;
+    let needs_maps = namespace::create_namespace().context("create_namespace")?;
 
-    // 2. Bring up loopback inside the new netns.
+    // 2. Signal parent: "I've unshared" — send 1 byte indicating whether maps are needed.
+    let signal_byte = if needs_maps { 1u8 } else { 0u8 };
+    let sock_bfd = unsafe { BorrowedFd::borrow_raw(sock) };
+    write(sock_bfd, &[signal_byte]).context("signal parent after unshare")?;
+
+    // 3. Wait for parent to write uid/gid maps (if needed).
+    if needs_maps {
+        tracing::debug!("child: waiting for parent to write id maps");
+        let mut ack = [0u8; 1];
+        read(sock, &mut ack).context("read maps-done ack")?;
+        tracing::debug!("child: id maps written by parent");
+    }
+
+    // 4. Bring up loopback inside the new netns.
     namespace::bringup_loopback().context("bringup_loopback")?;
 
-    // 3. Create tun0 and configure it.
+    // 5. Create tun0 and configure it.
     let tun_fd: RawFd = namespace::create_tun().context("create_tun")?;
 
-    // 4. Set up mount namespace with custom resolv.conf.
+    // 6. Set up mount namespace with custom resolv.conf.
     namespace::setup_mount_namespace().context("setup_mount_namespace")?;
 
-    // 5. Send the TUN fd to the parent.
+    // 7. Send the TUN fd to the parent.
     tracing::debug!("child: sending TUN fd to parent");
     fd_passing::send_fd(sock, tun_fd).context("send_fd")?;
 
-    // 6. Wait for the parent's ready signal (1 byte).
+    // 8. Wait for the parent's ready signal (1 byte).
     tracing::debug!("child: waiting for ready signal from parent");
     let mut ready = [0u8; 1];
     read(sock, &mut ready).context("read ready signal")?;
-    if ready[0] != 1 {
-        bail!("unexpected ready byte: {}", ready[0]);
-    }
     tracing::debug!("child: received ready signal, exec-ing command");
 
-    // 7. Close the socket before exec (CLOEXEC would handle it, but be explicit).
+    // 9. Close the socket before exec.
     let _ = close(sock);
 
-    // 8. exec the user's command.
+    // 10. exec the user's command.
     exec_command(&config.command)?;
 
     unreachable!()
@@ -206,15 +219,30 @@ fn exec_command(command: &[String]) -> Result<()> {
 // ── Parent logic ─────────────────────────────────────────────────────────────
 
 fn parent_main(sock: RawFd, child: nix::unistd::Pid, config: Config) -> Result<()> {
-    tracing::debug!("parent: waiting for TUN fd from child");
+    // 1. Wait for child to signal that it has unshared.
+    let mut unshare_signal = [0u8; 1];
+    read(sock, &mut unshare_signal).context("read unshare signal from child")?;
+    let needs_maps = unshare_signal[0] == 1;
+    tracing::debug!("parent: child unshared, needs_maps={needs_maps}");
 
-    // 1. Receive the TUN fd from the child.
+    // 2. If child created a user namespace, write its uid/gid maps from here.
+    if needs_maps {
+        let uid = nix::unistd::getuid().as_raw();
+        let gid = nix::unistd::getgid().as_raw();
+        namespace::write_id_maps(child.as_raw() as u32, uid, gid)
+            .context("write id maps for child")?;
+
+        // Signal child that maps are written.
+        let sock_bfd = unsafe { BorrowedFd::borrow_raw(sock) };
+        write(sock_bfd, &[1u8]).context("signal child maps done")?;
+    }
+
+    // 3. Receive the TUN fd from the child.
+    tracing::debug!("parent: waiting for TUN fd from child");
     let tun_fd: RawFd = fd_passing::recv_fd(sock).context("recv_fd")?;
     tracing::info!("parent: received TUN fd = {tun_fd}");
 
-    // 2. Signal child that we are ready (send byte 0x01).
-    // nix::unistd::write requires AsFd; wrap the raw fd with BorrowedFd.
-    // SAFETY: sock is a valid open file descriptor owned by this scope.
+    // 4. Signal child that we are ready (send byte 0x01).
     let sock_bfd = unsafe { BorrowedFd::borrow_raw(sock) };
     write(sock_bfd, &[1u8]).context("write ready signal")?;
     tracing::debug!("parent: sent ready signal to child");
