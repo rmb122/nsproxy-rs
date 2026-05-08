@@ -63,6 +63,10 @@ struct TcpForwardCtx {
     stream: ProxyStream,
     /// Data read from proxy, waiting to be written to smoltcp socket.
     proxy_to_app: Vec<u8>,
+    /// True once the proxy side has EOF'd (or errored). We stop reading
+    /// from proxy, drain whatever's left in `proxy_to_app` to the client,
+    /// and only then close the smoltcp tx side to propagate the FIN.
+    proxy_closed: bool,
 }
 
 // ── Public entry point ───────────────────────────────────────────────────────
@@ -373,6 +377,7 @@ pub async fn run(
                                 TcpForwardState::Established(TcpForwardCtx {
                                     stream,
                                     proxy_to_app: Vec::new(),
+                                    proxy_closed: false,
                                 }),
                             );
                         }
@@ -477,14 +482,18 @@ pub async fn run(
                 }
 
                 // --- Proxy → App direction ---
-                // 1. Read from proxy into proxy_to_app buffer (if buffer has space)
-                if ctx.proxy_to_app.len() < TCP_BUF_SIZE {
+                // 1. Read from proxy into proxy_to_app buffer (if buffer has space
+                //    AND we haven't already seen EOF). On EOF/error we only mark
+                //    proxy_closed; the smoltcp socket is closed below once the
+                //    buffer has been fully drained to the client, so no data is
+                //    lost to a premature FIN.
+                if !ctx.proxy_closed && ctx.proxy_to_app.len() < TCP_BUF_SIZE {
                     let space = TCP_BUF_SIZE - ctx.proxy_to_app.len();
                     match ctx.stream.inner.try_read(&mut tmp_buf[..space]) {
                         Ok(0) => {
-                            // Proxy EOF
+                            // Proxy EOF — defer close until the buffer is drained.
                             tracing::debug!("proxy stream closed for socket {handle}");
-                            sock.close();
+                            ctx.proxy_closed = true;
                         }
                         Ok(n) => {
                             ctx.proxy_to_app.extend_from_slice(&tmp_buf[..n]);
@@ -492,7 +501,7 @@ pub async fn run(
                         Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
                         Err(e) => {
                             tracing::debug!("proxy read error: {e}");
-                            sock.close();
+                            ctx.proxy_closed = true;
                         }
                     }
                 }
@@ -512,6 +521,12 @@ pub async fn run(
                             }
                         }
                     }
+                }
+
+                // 3. If proxy is gone and we've flushed everything we buffered,
+                //    close the smoltcp tx side to propagate the FIN to the client.
+                if ctx.proxy_closed && ctx.proxy_to_app.is_empty() && sock.may_send() {
+                    sock.close();
                 }
 
                 // Check if smoltcp socket closed.
