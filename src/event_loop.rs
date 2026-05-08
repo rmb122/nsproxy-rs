@@ -76,15 +76,21 @@ pub async fn run(
 
     let mut iface = Interface::new(iface_config, &mut device, SmolInstant::now());
 
-    // Assign our gateway IP to the interface (we ARE the gateway from smoltcp's perspective).
+    // Add our gateway IP. With any_ip=true set below, smoltcp will accept
+    // packets for ANY destination, not just this IP.
     iface.update_ip_addrs(|addrs| {
         addrs
-            .push(IpCidr::new(IpAddress::Ipv4(TUN_GW), 31))
+            .push(IpCidr::new(IpAddress::Ipv4(smoltcp::wire::Ipv4Address::new(172, 23, 255, 254)), 31))
             .unwrap();
     });
 
     // Route for the fake-DNS range and all traffic.
     iface.routes_mut().add_default_ipv4_route(TUN_GW).unwrap();
+
+    // Accept packets for ANY destination IP (not just our own).
+    // This is essential: apps connect to fake IPs (198.18.x.x) and real IPs,
+    // all of which arrive at our TUN. Without this, smoltcp drops them.
+    iface.set_any_ip(true);
 
     // --- Create socket set ---
     let mut sockets = SocketSet::new(vec![]);
@@ -179,8 +185,10 @@ pub async fn run(
                         let rx_buf = tcp::SocketBuffer::new(vec![0u8; TCP_BUF_SIZE]);
                         let tx_buf = tcp::SocketBuffer::new(vec![0u8; TCP_BUF_SIZE]);
                         let mut sock = tcp::Socket::new(rx_buf, tx_buf);
+                        // Listen with addr: None so smoltcp accepts packets to ANY dst IP
+                        // (traffic to fake IPs like 198.18.x.x arrives at our TUN)
                         let listen_ep = IpListenEndpoint {
-                            addr: Some(IpAddress::Ipv4(dst_ip)),
+                            addr: None,
                             port: dst_port,
                         };
                         if sock.listen(listen_ep).is_ok() {
@@ -197,6 +205,17 @@ pub async fn run(
 
         // 4. Let smoltcp process packets.
         iface.poll(SmolInstant::now(), &mut device, &mut sockets);
+
+        // Debug: print TCP socket states
+        for (handle, state) in tcp_states.iter() {
+            if matches!(state, TcpForwardState::Listening) {
+                let sock = sockets.get::<tcp::Socket>(*handle);
+                let s = sock.state();
+                if s != tcp::State::Listen {
+                    tracing::debug!("socket {handle}: state={s:?} local={:?} remote={:?}", sock.local_endpoint(), sock.remote_endpoint());
+                }
+            }
+        }
 
         // 5. Handle DNS — check UDP socket for queries.
         {

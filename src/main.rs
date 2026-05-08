@@ -78,6 +78,9 @@ fn main() -> Result<()> {
         .with_target(false)
         .init();
 
+    // Enable smoltcp's internal logging (uses `log` crate)
+    let _ = env_logger::try_init();
+
     // --- build Config --------------------------------------------------------
     let proxy_type = if cli.http {
         ProxyType::Http
