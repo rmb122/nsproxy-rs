@@ -1,0 +1,19 @@
+[package]
+name = "nsproxy-rs"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+tokio = { version = "1", features = ["rt-multi-thread", "net", "io-util", "macros", "sync", "signal"] }
+smoltcp = { version = "0.12", default-features = false, features = ["medium-ip", "proto-ipv4", "socket-tcp", "socket-udp"] }
+nix = { version = "0.29", features = ["sched", "mount", "ioctl", "socket", "user", "net", "fs", "signal", "process"] }
+clap = { version = "4", features = ["derive"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+anyhow = "1"
+async-trait = "0.1"
+libc = "0.2"
+
+[profile.release]
+lto = true
+strip = true
