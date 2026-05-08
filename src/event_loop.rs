@@ -28,13 +28,13 @@ use crate::tun::{TunDevice, parse_tcp_syn};
 // ── Constants ────────────────────────────────────────────────────────────────
 
 /// The IP address assigned to the TUN interface inside the namespace.
-/// Matches what namespace.rs configures: 10.0.0.1/24.
+/// Matches what namespace.rs configures: 172.23.255.255/31.
 #[allow(dead_code)]
-const TUN_ADDR: Ipv4Addr = Ipv4Addr::new(10, 0, 0, 1);
-/// The gateway IP (our side of the TUN).
-const TUN_GW: Ipv4Addr = Ipv4Addr::new(10, 0, 0, 2);
-/// DNS server IP that resolv.conf points to.
-const DNS_ADDR: Ipv4Addr = Ipv4Addr::new(10, 0, 0, 2);
+const TUN_ADDR: Ipv4Addr = Ipv4Addr::new(172, 23, 255, 255);
+/// The gateway IP (our side of the TUN) — smoltcp's interface address.
+const TUN_GW: Ipv4Addr = Ipv4Addr::new(172, 23, 255, 254);
+/// DNS server IP that resolv.conf points to (same as gateway).
+const DNS_ADDR: Ipv4Addr = Ipv4Addr::new(172, 23, 255, 254);
 /// DNS port.
 const DNS_PORT: u16 = 53;
 
@@ -74,7 +74,7 @@ pub async fn run(tun_fd: RawFd, config: AppConfig, mut shutdown: tokio::sync::wa
 
     // Assign our gateway IP to the interface (we ARE the gateway from smoltcp's perspective).
     iface.update_ip_addrs(|addrs| {
-        addrs.push(IpCidr::new(IpAddress::Ipv4(TUN_GW), 24)).unwrap();
+        addrs.push(IpCidr::new(IpAddress::Ipv4(TUN_GW), 31)).unwrap();
     });
 
     // Route for the fake-DNS range and all traffic.
