@@ -94,12 +94,6 @@ Credits
 -------
 
 This project is a Rust reimplementation inspired by
-[nsproxy](https://github.com/niceda/nsproxy) by NaLan ZeYu. The original C
+[nsproxy](https://github.com/nlzy/nsproxy) by NaLan ZeYu. The original C
 implementation uses lwIP as its user-space TCP/IP stack and forwards DNS to a
 real server; this version uses smoltcp and a fake-DNS approach instead.
-
-
-License
--------
-
-GPL-2.0-or-later
