@@ -97,12 +97,14 @@ pub fn write_id_maps(child_pid: u32, uid: u32, gid: u32) -> Result<()> {
     // Deny setgroups (required before gid_map write)
     proc_write(&setgroups_path, "deny")?;
 
-    // Write uid_map: "0 <real_uid> 1" — map root inside to real uid outside
-    // This gives the process full capabilities inside the namespace
-    proc_write(&uid_map_path, &format!("0 {} 1\n", uid))?;
+    // Write uid_map: "<uid> <uid> 1" — map real uid to itself inside namespace.
+    // The initial user of a user namespace has full capabilities regardless of uid,
+    // so uid 1000 still has CAP_NET_ADMIN for network configuration.
+    // This keeps file ownership correct (home dir, ssh keys, etc.).
+    proc_write(&uid_map_path, &format!("{} {} 1\n", uid, uid))?;
 
-    // Write gid_map: "0 <real_gid> 1"
-    proc_write(&gid_map_path, &format!("0 {} 1\n", gid))?;
+    // Write gid_map: "<gid> <gid> 1"
+    proc_write(&gid_map_path, &format!("{} {} 1\n", gid, gid))?;
 
     tracing::debug!("wrote id maps for pid {} (uid={}, gid={})", child_pid, uid, gid);
     Ok(())
