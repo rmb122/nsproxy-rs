@@ -1,6 +1,7 @@
 mod config;
 mod fd_passing;
 mod namespace;
+mod proxy;
 
 use std::ffi::CString;
 use std::os::unix::io::{AsRawFd, BorrowedFd, RawFd};
