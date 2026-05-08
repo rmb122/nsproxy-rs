@@ -6,13 +6,10 @@
 //!   3. `setup_mount_namespace()`
 //!   4. `create_tun()` → RawFd that is passed to the parent via fd_passing
 
-use std::fs;
 use std::os::unix::io::RawFd;
-use std::process::Command;
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result};
 use nix::sched::{CloneFlags, unshare};
-use nix::unistd::{getgid, getuid};
 
 // ── TUNSETIFF constants (architecture-aware, same logic as smoltcp) ──────────
 
@@ -336,15 +333,3 @@ pub fn create_tun() -> Result<RawFd> {
     Ok(fd)
 }
 
-// ── Internal helpers ─────────────────────────────────────────────────────────
-
-fn run_cmd(prog: &str, args: &[&str]) -> Result<()> {
-    let status = Command::new(prog)
-        .args(args)
-        .status()
-        .with_context(|| format!("spawn {prog}"))?;
-    if !status.success() {
-        bail!("{prog} {} exited with {status}", args.join(" "));
-    }
-    Ok(())
-}

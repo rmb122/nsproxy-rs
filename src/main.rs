@@ -109,8 +109,6 @@ fn main() -> Result<()> {
     // Enable smoltcp's internal logging (uses `log` crate)
     let _ = env_logger::try_init();
 
-    let verbose_level = if cli.quiet { -1 } else { cli.verbose as i32 };
-
     // --- build Config --------------------------------------------------------
     let (proxy_type, proxy_addr, proxy_auth) = parse_proxy_url(&cli.proxy)?;
 
@@ -118,7 +116,6 @@ fn main() -> Result<()> {
         proxy_type,
         proxy_addr,
         proxy_auth,
-        verbose: verbose_level,
         command: cli.command.clone(),
     };
     tracing::debug!(?config, "parsed configuration");
