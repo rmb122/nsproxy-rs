@@ -110,16 +110,25 @@ pub fn write_id_maps(child_pid: u32, uid: u32, gid: u32) -> Result<()> {
 
 // ── Mount namespace + resolv.conf ────────────────────────────────────────────
 
-/// Create a private mount namespace and bind-mount a custom `resolv.conf` that
-/// points DNS at our virtual gateway `172.23.255.254`.
+/// Create a private mount namespace and bind-mount custom `resolv.conf` and
+/// `nsswitch.conf` to force DNS through our fake resolver at 172.23.255.254.
 pub fn setup_mount_namespace() -> Result<()> {
     unshare(CloneFlags::CLONE_NEWNS).context("unshare(CLONE_NEWNS)")?;
 
-    // Write a temporary resolv.conf
+    // Make the mount namespace fully private (no propagation to/from host)
+    nix::mount::mount(
+        None::<&str>,
+        "/",
+        None::<&str>,
+        nix::mount::MsFlags::MS_REC | nix::mount::MsFlags::MS_PRIVATE,
+        None::<&str>,
+    )
+    .context("make root mount private")?;
+
+    // Write and bind-mount custom resolv.conf
     let tmp_resolv = "/tmp/nsproxy-resolv.conf";
     fs::write(tmp_resolv, "nameserver 172.23.255.254\n").context("write temp resolv.conf")?;
 
-    // Bind-mount it over /etc/resolv.conf
     nix::mount::mount(
         Some(tmp_resolv),
         "/etc/resolv.conf",
@@ -128,6 +137,20 @@ pub fn setup_mount_namespace() -> Result<()> {
         None::<&str>,
     )
     .context("bind-mount resolv.conf")?;
+
+    // Write and bind-mount custom nsswitch.conf to force plain DNS
+    // (bypass systemd-resolved, mymachines, mdns, etc.)
+    let tmp_nsswitch = "/tmp/nsproxy-nsswitch.conf";
+    fs::write(tmp_nsswitch, "hosts: files dns\n").context("write temp nsswitch.conf")?;
+
+    nix::mount::mount(
+        Some(tmp_nsswitch),
+        "/etc/nsswitch.conf",
+        None::<&str>,
+        nix::mount::MsFlags::MS_BIND,
+        None::<&str>,
+    )
+    .context("bind-mount nsswitch.conf")?;
 
     tracing::debug!("mount namespace set up; DNS → 172.23.255.254");
     Ok(())
