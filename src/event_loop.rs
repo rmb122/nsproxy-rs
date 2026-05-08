@@ -80,7 +80,10 @@ pub async fn run(
     // packets for ANY destination, not just this IP.
     iface.update_ip_addrs(|addrs| {
         addrs
-            .push(IpCidr::new(IpAddress::Ipv4(smoltcp::wire::Ipv4Address::new(172, 23, 255, 254)), 31))
+            .push(IpCidr::new(
+                IpAddress::Ipv4(smoltcp::wire::Ipv4Address::new(172, 23, 255, 254)),
+                31,
+            ))
             .unwrap();
     });
 
@@ -212,7 +215,11 @@ pub async fn run(
                 let sock = sockets.get::<tcp::Socket>(*handle);
                 let s = sock.state();
                 if s != tcp::State::Listen {
-                    tracing::debug!("socket {handle}: state={s:?} local={:?} remote={:?}", sock.local_endpoint(), sock.remote_endpoint());
+                    tracing::debug!(
+                        "socket {handle}: state={s:?} local={:?} remote={:?}",
+                        sock.local_endpoint(),
+                        sock.remote_endpoint()
+                    );
                 }
             }
         }

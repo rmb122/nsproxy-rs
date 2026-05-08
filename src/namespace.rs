@@ -103,7 +103,12 @@ pub fn write_id_maps(child_pid: u32, uid: u32, gid: u32) -> Result<()> {
     // Write gid_map: "<gid> <gid> 1"
     proc_write(&gid_map_path, &format!("{} {} 1\n", gid, gid))?;
 
-    tracing::debug!("wrote id maps for pid {} (uid={}, gid={})", child_pid, uid, gid);
+    tracing::debug!(
+        "wrote id maps for pid {} (uid={}, gid={})",
+        child_pid,
+        uid,
+        gid
+    );
     Ok(())
 }
 
@@ -154,8 +159,7 @@ fn bind_mount_tmpfile(content: &str, target: &str) -> Result<()> {
     use std::os::unix::io::FromRawFd;
 
     // nix::unistd::mkstemp creates a temp file and returns (RawFd, PathBuf)
-    let (fd, path) = nix::unistd::mkstemp("/tmp/nsproxy-XXXXXX")
-        .context("mkstemp")?;
+    let (fd, path) = nix::unistd::mkstemp("/tmp/nsproxy-XXXXXX").context("mkstemp")?;
 
     // SAFETY: mkstemp returns a valid, exclusively-owned fd
     let mut file = unsafe { std::fs::File::from_raw_fd(fd) };
@@ -192,7 +196,11 @@ pub fn bringup_loopback() -> Result<()> {
 
         let mut ifr: libc::ifreq = std::mem::zeroed();
         let name = b"lo\0";
-        std::ptr::copy_nonoverlapping(name.as_ptr(), ifr.ifr_name.as_mut_ptr() as *mut u8, name.len());
+        std::ptr::copy_nonoverlapping(
+            name.as_ptr(),
+            ifr.ifr_name.as_mut_ptr() as *mut u8,
+            name.len(),
+        );
         ifr.ifr_ifru.ifru_flags = (libc::IFF_UP | libc::IFF_RUNNING) as i16;
 
         if libc::ioctl(sock, libc::SIOCSIFFLAGS as _, &ifr as *const _) < 0 {
@@ -261,47 +269,69 @@ pub fn create_tun() -> Result<RawFd> {
         let sock = libc::socket(libc::AF_INET, libc::SOCK_DGRAM | libc::SOCK_CLOEXEC, 0);
         if sock < 0 {
             libc::close(fd);
-            anyhow::bail!("socket() for tun config: {}", std::io::Error::last_os_error());
+            anyhow::bail!(
+                "socket() for tun config: {}",
+                std::io::Error::last_os_error()
+            );
         }
 
         let mut ifr: libc::ifreq = std::mem::zeroed();
         let name = b"tun0\0";
-        std::ptr::copy_nonoverlapping(name.as_ptr(), ifr.ifr_name.as_mut_ptr() as *mut u8, name.len());
+        std::ptr::copy_nonoverlapping(
+            name.as_ptr(),
+            ifr.ifr_name.as_mut_ptr() as *mut u8,
+            name.len(),
+        );
 
         // Set MTU
         ifr.ifr_ifru.ifru_mtu = 65000;
         if libc::ioctl(sock, libc::SIOCSIFMTU as _, &ifr as *const _) < 0 {
-            libc::close(sock); libc::close(fd);
+            libc::close(sock);
+            libc::close(fd);
             anyhow::bail!("ioctl SIOCSIFMTU: {}", std::io::Error::last_os_error());
         }
 
         // Set IP address: 172.23.255.255
         let mut addr_ifr: libc::ifreq = std::mem::zeroed();
-        std::ptr::copy_nonoverlapping(name.as_ptr(), addr_ifr.ifr_name.as_mut_ptr() as *mut u8, name.len());
+        std::ptr::copy_nonoverlapping(
+            name.as_ptr(),
+            addr_ifr.ifr_name.as_mut_ptr() as *mut u8,
+            name.len(),
+        );
         let sin = &mut addr_ifr.ifr_ifru.ifru_addr as *mut libc::sockaddr as *mut libc::sockaddr_in;
         (*sin).sin_family = libc::AF_INET as u16;
         (*sin).sin_addr.s_addr = u32::from_be_bytes([172, 23, 255, 255]).to_be();
         if libc::ioctl(sock, libc::SIOCSIFADDR as _, &addr_ifr as *const _) < 0 {
-            libc::close(sock); libc::close(fd);
+            libc::close(sock);
+            libc::close(fd);
             anyhow::bail!("ioctl SIOCSIFADDR: {}", std::io::Error::last_os_error());
         }
 
         // Set netmask: 255.255.255.254 (/31)
         let mut mask_ifr: libc::ifreq = std::mem::zeroed();
-        std::ptr::copy_nonoverlapping(name.as_ptr(), mask_ifr.ifr_name.as_mut_ptr() as *mut u8, name.len());
+        std::ptr::copy_nonoverlapping(
+            name.as_ptr(),
+            mask_ifr.ifr_name.as_mut_ptr() as *mut u8,
+            name.len(),
+        );
         let sin = &mut mask_ifr.ifr_ifru.ifru_addr as *mut libc::sockaddr as *mut libc::sockaddr_in;
         (*sin).sin_family = libc::AF_INET as u16;
         (*sin).sin_addr.s_addr = u32::from_be_bytes([255, 255, 255, 254]).to_be();
         if libc::ioctl(sock, libc::SIOCSIFNETMASK as _, &mask_ifr as *const _) < 0 {
-            libc::close(sock); libc::close(fd);
+            libc::close(sock);
+            libc::close(fd);
             anyhow::bail!("ioctl SIOCSIFNETMASK: {}", std::io::Error::last_os_error());
         }
 
         // Bring up tun0
         ifr.ifr_ifru.ifru_flags = (libc::IFF_UP | libc::IFF_RUNNING) as i16;
         if libc::ioctl(sock, libc::SIOCSIFFLAGS as _, &ifr as *const _) < 0 {
-            libc::close(sock); libc::close(fd);
-            anyhow::bail!("ioctl SIOCSIFFLAGS tun0 UP: {}", std::io::Error::last_os_error());
+            libc::close(sock);
+            libc::close(fd);
+            anyhow::bail!(
+                "ioctl SIOCSIFFLAGS tun0 UP: {}",
+                std::io::Error::last_os_error()
+            );
         }
 
         // Add default route via 172.23.255.254
@@ -322,7 +352,8 @@ pub fn create_tun() -> Result<RawFd> {
         route.rt_dev = name.as_ptr() as *mut i8;
 
         if libc::ioctl(sock, libc::SIOCADDRT as _, &route as *const _) < 0 {
-            libc::close(sock); libc::close(fd);
+            libc::close(sock);
+            libc::close(fd);
             anyhow::bail!("ioctl SIOCADDRT: {}", std::io::Error::last_os_error());
         }
 
@@ -332,4 +363,3 @@ pub fn create_tun() -> Result<RawFd> {
     tracing::debug!("tun0 configured: 172.23.255.255/31, mtu 65000, gw 172.23.255.254");
     Ok(fd)
 }
-

@@ -48,7 +48,9 @@ struct Cli {
 }
 
 /// Parse a proxy URL like "socks5://user:pass@host:port" into Config fields.
-fn parse_proxy_url(url: &str) -> Result<(ProxyType, std::net::SocketAddr, Option<(String, String)>)> {
+fn parse_proxy_url(
+    url: &str,
+) -> Result<(ProxyType, std::net::SocketAddr, Option<(String, String)>)> {
     // Determine scheme
     let (proxy_type, rest) = if let Some(rest) = url.strip_prefix("socks5://") {
         (ProxyType::Socks5, rest)
@@ -57,7 +59,10 @@ fn parse_proxy_url(url: &str) -> Result<(ProxyType, std::net::SocketAddr, Option
     } else if let Some(rest) = url.strip_prefix("http://") {
         (ProxyType::Http, rest)
     } else {
-        bail!("unsupported proxy scheme in '{}'. Use socks5:// or http://", url);
+        bail!(
+            "unsupported proxy scheme in '{}'. Use socks5:// or http://",
+            url
+        );
     };
 
     // Split auth from host:port
