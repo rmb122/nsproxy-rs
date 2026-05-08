@@ -393,6 +393,7 @@ pub async fn run(
 
         // 7. Shuttle data for established connections.
         {
+            let mut tmp_buf = vec![0u8; TCP_BUF_SIZE];
             let established_handles: Vec<SocketHandle> = tcp_states
                 .iter()
                 .filter_map(|(h, s)| {
@@ -414,23 +415,31 @@ pub async fn run(
                 let sock = sockets.get_mut::<tcp::Socket>(handle);
 
                 // --- App → Proxy direction ---
-                // 1. Read from smoltcp into app_to_proxy buffer (if buffer has space)
-                if sock.can_recv() && ctx.app_to_proxy.len() < TCP_BUF_SIZE {
-                    let space = TCP_BUF_SIZE - ctx.app_to_proxy.len();
-                    let mut tmp = vec![0u8; space];
-                    match sock.recv_slice(&mut tmp) {
+                // Use peek to look at data without consuming, then only drain what we write.
+                if ctx.app_to_proxy.is_empty() && sock.may_recv() {
+                    // Try to peek at available data in smoltcp rx buffer
+                    match sock.peek_slice(&mut tmp_buf) {
                         Ok(n) if n > 0 => {
-                            ctx.app_to_proxy.extend_from_slice(&tmp[..n]);
+                            match ctx.stream.inner.try_write(&tmp_buf[..n]) {
+                                Ok(written) => {
+                                    // Actually consume only what we wrote
+                                    sock.recv(|_| (written, ())).ok();
+                                }
+                                Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                                    // proxy not writable yet, leave data in smoltcp buffer
+                                }
+                                Err(e) => {
+                                    tracing::debug!("proxy write error: {e}");
+                                    sock.close();
+                                }
+                            }
                         }
                         _ => {}
                     }
-                }
-                // 2. Drain app_to_proxy buffer into proxy stream
-                if !ctx.app_to_proxy.is_empty() {
+                } else if !ctx.app_to_proxy.is_empty() {
+                    // Drain residual buffer from previous iterations
                     match ctx.stream.inner.try_write(&ctx.app_to_proxy) {
-                        Ok(n) => {
-                            ctx.app_to_proxy.drain(..n);
-                        }
+                        Ok(n) => { ctx.app_to_proxy.drain(..n); }
                         Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
                         Err(e) => {
                             tracing::debug!("proxy write error: {e}");
@@ -443,15 +452,14 @@ pub async fn run(
                 // 1. Read from proxy into proxy_to_app buffer (if buffer has space)
                 if ctx.proxy_to_app.len() < TCP_BUF_SIZE {
                     let space = TCP_BUF_SIZE - ctx.proxy_to_app.len();
-                    let mut tmp = vec![0u8; space];
-                    match ctx.stream.inner.try_read(&mut tmp) {
+                    match ctx.stream.inner.try_read(&mut tmp_buf[..space]) {
                         Ok(0) => {
                             // Proxy EOF
                             tracing::debug!("proxy stream closed for socket {handle}");
                             sock.close();
                         }
                         Ok(n) => {
-                            ctx.proxy_to_app.extend_from_slice(&tmp[..n]);
+                            ctx.proxy_to_app.extend_from_slice(&tmp_buf[..n]);
                         }
                         Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
                         Err(e) => {
