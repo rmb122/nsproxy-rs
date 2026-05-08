@@ -132,7 +132,8 @@ pub async fn run(
     // multiple connections to the same dst_ip:dst_port (different src ports).
     let mut listening_endpoints: HashSet<(Ipv4Addr, u16, Ipv4Addr, u16)> = HashSet::new();
     // Reverse map: socket handle → 4-tuple, for cleanup
-    let mut handle_to_endpoint: HashMap<SocketHandle, (Ipv4Addr, u16, Ipv4Addr, u16)> = HashMap::new();
+    let mut handle_to_endpoint: HashMap<SocketHandle, (Ipv4Addr, u16, Ipv4Addr, u16)> =
+        HashMap::new();
 
     // Build the proxy connector.
     let _connector: Box<dyn ProxyConnector> = match config.proxy_type {
@@ -433,9 +434,7 @@ pub async fn run(
                         }
                         match stream_inner.try_write(data) {
                             Ok(written) => (written, Ok(written)),
-                            Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                                (0, Ok(0))
-                            }
+                            Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => (0, Ok(0)),
                             Err(e) => (0, Err(e)),
                         }
                     });
