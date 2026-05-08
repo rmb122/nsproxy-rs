@@ -38,9 +38,9 @@ struct Cli {
     #[arg(short = 'v', long = "verbose", action = clap::ArgAction::Count)]
     verbose: u8,
 
-    /// Decrease verbosity (may be repeated)
-    #[arg(short = 'q', long = "quiet", action = clap::ArgAction::Count)]
-    quiet: u8,
+    /// Suppress all log output
+    #[arg(short = 'q', long = "quiet")]
+    quiet: bool,
 
     /// Command to run inside the namespace (and its arguments)
     #[arg(trailing_var_arg = true, required = true)]
@@ -89,22 +89,27 @@ fn main() -> Result<()> {
     let cli = Cli::parse();
 
     // --- tracing init --------------------------------------------------------
-    let verbose_level = (cli.verbose as i32) - (cli.quiet as i32);
-    let log_level = match verbose_level {
-        i32::MIN..=-2 => Level::ERROR,
-        -1 => Level::WARN,
-        0 => Level::INFO,
-        1 => Level::DEBUG,
-        2.. => Level::TRACE,
+    let log_level = if cli.quiet {
+        None
+    } else {
+        Some(match cli.verbose {
+            0 => Level::INFO,
+            1 => Level::DEBUG,
+            _ => Level::TRACE,
+        })
     };
 
-    tracing_subscriber::fmt()
-        .with_max_level(log_level)
-        .with_target(false)
-        .init();
+    if let Some(level) = log_level {
+        tracing_subscriber::fmt()
+            .with_max_level(level)
+            .with_target(false)
+            .init();
+    }
 
     // Enable smoltcp's internal logging (uses `log` crate)
     let _ = env_logger::try_init();
+
+    let verbose_level = if cli.quiet { -1 } else { cli.verbose as i32 };
 
     // --- build Config --------------------------------------------------------
     let (proxy_type, proxy_addr, proxy_auth) = parse_proxy_url(&cli.proxy)?;
