@@ -268,7 +268,7 @@ fn parent_main(sock: RawFd, child: nix::unistd::Pid, config: Config) -> Result<(
         .build()
         .context("build tokio runtime")?;
 
-    rt.block_on(async move {
+    let exit_code = rt.block_on(async move {
         // Shutdown channel: event loop stops when we signal true.
         let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
 
@@ -277,16 +277,16 @@ fn parent_main(sock: RawFd, child: nix::unistd::Pid, config: Config) -> Result<(
 
         // Wait for child to exit (in a blocking fashion on a separate thread).
         let child_pid = child;
-        let child_wait = tokio::task::spawn_blocking(move || -> Result<()> {
+        let child_wait = tokio::task::spawn_blocking(move || -> Result<i32> {
             loop {
                 match waitpid(child_pid, None) {
                     Ok(WaitStatus::Exited(_, code)) => {
                         tracing::info!("parent: child exited with code {code}");
-                        return Ok(());
+                        return Ok(code);
                     }
                     Ok(WaitStatus::Signaled(_, sig, _)) => {
                         tracing::info!("parent: child killed by signal {sig}");
-                        return Ok(());
+                        return Ok(128 + sig as i32);
                     }
                     Ok(status) => {
                         tracing::debug!("parent: child status {status:?}, continuing wait");
@@ -301,9 +301,17 @@ fn parent_main(sock: RawFd, child: nix::unistd::Pid, config: Config) -> Result<(
         });
 
         // Wait for child exit.
-        if let Err(e) = child_wait.await {
-            tracing::warn!("child wait task failed: {e}");
-        }
+        let exit_code = match child_wait.await {
+            Ok(Ok(code)) => code,
+            Ok(Err(e)) => {
+                tracing::warn!("child wait error: {e}");
+                1
+            }
+            Err(e) => {
+                tracing::warn!("child wait task failed: {e}");
+                1
+            }
+        };
 
         // Signal the event loop to shut down.
         let _ = shutdown_tx.send(true);
@@ -324,12 +332,12 @@ fn parent_main(sock: RawFd, child: nix::unistd::Pid, config: Config) -> Result<(
             }
         }
 
-        Ok::<(), anyhow::Error>(())
+        Ok::<i32, anyhow::Error>(exit_code)
     })?;
 
     // Close the TUN fd and socket.
     let _ = close(tun_fd);
     let _ = close(sock);
 
-    Ok(())
+    std::process::exit(exit_code)
 }
