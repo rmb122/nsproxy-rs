@@ -7,11 +7,9 @@
 use std::io::{IoSlice, IoSliceMut};
 use std::os::unix::io::RawFd;
 
-use anyhow::{bail, Context, Result};
-use nix::sys::socket::{
-    recvmsg, sendmsg, ControlMessage, ControlMessageOwned, MsgFlags,
-};
+use anyhow::{Context, Result, bail};
 use nix::sys::socket::UnixAddr;
+use nix::sys::socket::{ControlMessage, ControlMessageOwned, MsgFlags, recvmsg, sendmsg};
 
 /// Send a single raw file descriptor over a connected Unix socket.
 ///
@@ -23,8 +21,7 @@ pub fn send_fd(sock: RawFd, fd: RawFd) -> Result<()> {
     let dummy = [0u8; 1];
     let iov = [IoSlice::new(&dummy)];
 
-    sendmsg::<UnixAddr>(sock, &iov, &cmsg, MsgFlags::empty(), None)
-        .context("sendmsg (send_fd)")?;
+    sendmsg::<UnixAddr>(sock, &iov, &cmsg, MsgFlags::empty(), None).context("sendmsg (send_fd)")?;
     Ok(())
 }
 

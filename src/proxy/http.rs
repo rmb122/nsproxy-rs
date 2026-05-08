@@ -8,7 +8,7 @@
 /// target.  No extra dependencies — base64 encoding is inlined.
 use std::net::SocketAddr;
 
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result, bail};
 use async_trait::async_trait;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::TcpStream;
@@ -151,8 +151,7 @@ fn parse_status_code(status_line: &str) -> Result<u16> {
 
 // ── Inline base64 encoder ─────────────────────────────────────────────────────
 
-const B64_ALPHABET: &[u8; 64] =
-    b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+const B64_ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
 
 /// Encode `input` as standard (padded) base64.
 fn base64_encode(input: &[u8]) -> String {
@@ -213,8 +212,14 @@ mod tests {
 
     #[test]
     fn parse_status_code_ok() {
-        assert_eq!(parse_status_code("HTTP/1.1 200 Connection established").unwrap(), 200);
-        assert_eq!(parse_status_code("HTTP/1.0 407 Proxy Auth Required").unwrap(), 407);
+        assert_eq!(
+            parse_status_code("HTTP/1.1 200 Connection established").unwrap(),
+            200
+        );
+        assert_eq!(
+            parse_status_code("HTTP/1.0 407 Proxy Auth Required").unwrap(),
+            407
+        );
     }
 
     #[test]

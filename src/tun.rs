@@ -61,13 +61,7 @@ impl TunDevice {
     /// into `rx_queue`. Returns `true` if a packet was read.
     pub fn poll_read(&mut self) -> bool {
         let mut buf = vec![0u8; MTU + 100];
-        let n = unsafe {
-            libc::read(
-                self.fd,
-                buf.as_mut_ptr() as *mut libc::c_void,
-                buf.len(),
-            )
-        };
+        let n = unsafe { libc::read(self.fd, buf.as_mut_ptr() as *mut libc::c_void, buf.len()) };
 
         if n <= 0 {
             return false;
@@ -146,13 +140,7 @@ impl TxToken for TunTxToken {
         let result = f(&mut buf);
 
         // Write the packet to the TUN device.
-        let n = unsafe {
-            libc::write(
-                self.fd,
-                buf.as_ptr() as *const libc::c_void,
-                buf.len(),
-            )
-        };
+        let n = unsafe { libc::write(self.fd, buf.as_ptr() as *const libc::c_void, buf.len()) };
         if n < 0 {
             let err = std::io::Error::last_os_error();
             tracing::warn!("tun write error: {err}");

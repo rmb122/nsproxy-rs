@@ -62,7 +62,11 @@ enum TcpForwardState {
 
 /// Run the main event loop.  This takes ownership of the TUN fd and runs until
 /// `shutdown` is signalled (typically by the child exiting).
-pub async fn run(tun_fd: RawFd, config: AppConfig, mut shutdown: tokio::sync::watch::Receiver<bool>) -> Result<()> {
+pub async fn run(
+    tun_fd: RawFd,
+    config: AppConfig,
+    mut shutdown: tokio::sync::watch::Receiver<bool>,
+) -> Result<()> {
     // --- Create the smoltcp device ---
     let mut device = TunDevice::new(tun_fd).context("TunDevice::new")?;
 
@@ -74,14 +78,13 @@ pub async fn run(tun_fd: RawFd, config: AppConfig, mut shutdown: tokio::sync::wa
 
     // Assign our gateway IP to the interface (we ARE the gateway from smoltcp's perspective).
     iface.update_ip_addrs(|addrs| {
-        addrs.push(IpCidr::new(IpAddress::Ipv4(TUN_GW), 31)).unwrap();
+        addrs
+            .push(IpCidr::new(IpAddress::Ipv4(TUN_GW), 31))
+            .unwrap();
     });
 
     // Route for the fake-DNS range and all traffic.
-    iface
-        .routes_mut()
-        .add_default_ipv4_route(TUN_GW)
-        .unwrap();
+    iface.routes_mut().add_default_ipv4_route(TUN_GW).unwrap();
 
     // --- Create socket set ---
     let mut sockets = SocketSet::new(vec![]);
@@ -97,8 +100,11 @@ pub async fn run(tun_fd: RawFd, config: AppConfig, mut shutdown: tokio::sync::wa
             vec![0u8; UDP_BUF_SIZE],
         );
         let mut sock = udp::Socket::new(rx_buf, tx_buf);
-        sock.bind(IpListenEndpoint { addr: Some(IpAddress::Ipv4(DNS_ADDR)), port: DNS_PORT })
-            .expect("bind DNS UDP socket");
+        sock.bind(IpListenEndpoint {
+            addr: Some(IpAddress::Ipv4(DNS_ADDR)),
+            port: DNS_PORT,
+        })
+        .expect("bind DNS UDP socket");
         sockets.add(sock)
     };
 
@@ -110,8 +116,14 @@ pub async fn run(tun_fd: RawFd, config: AppConfig, mut shutdown: tokio::sync::wa
 
     // Build the proxy connector.
     let _connector: Box<dyn ProxyConnector> = match config.proxy_type {
-        ProxyType::Socks5 => Box::new(Socks5Connector::new(config.proxy_addr, config.proxy_auth.clone())),
-        ProxyType::Http => Box::new(HttpConnector::new(config.proxy_addr, config.proxy_auth.clone())),
+        ProxyType::Socks5 => Box::new(Socks5Connector::new(
+            config.proxy_addr,
+            config.proxy_auth.clone(),
+        )),
+        ProxyType::Http => Box::new(HttpConnector::new(
+            config.proxy_addr,
+            config.proxy_auth.clone(),
+        )),
     };
 
     // Wrap the TUN fd in AsyncFd for readability notifications.
@@ -132,7 +144,9 @@ pub async fn run(tun_fd: RawFd, config: AppConfig, mut shutdown: tokio::sync::wa
             .poll_delay(SmolInstant::now(), &sockets)
             .unwrap_or(smoltcp::time::Duration::from_millis(50));
         let timeout = Duration::from_millis(wait_duration.total_millis());
-        let timeout = timeout.max(Duration::from_millis(1)).min(Duration::from_millis(100));
+        let timeout = timeout
+            .max(Duration::from_millis(1))
+            .min(Duration::from_millis(100));
 
         tokio::select! {
             biased;
@@ -159,7 +173,9 @@ pub async fn run(tun_fd: RawFd, config: AppConfig, mut shutdown: tokio::sync::wa
             for pkt in queue.iter() {
                 if let Some((dst_ip, dst_port)) = parse_tcp_syn(pkt) {
                     if !listening_endpoints.contains(&(dst_ip, dst_port)) {
-                        tracing::debug!("SYN detected → {dst_ip}:{dst_port}, creating listen socket");
+                        tracing::debug!(
+                            "SYN detected → {dst_ip}:{dst_port}, creating listen socket"
+                        );
                         let rx_buf = tcp::SocketBuffer::new(vec![0u8; TCP_BUF_SIZE]);
                         let tx_buf = tcp::SocketBuffer::new(vec![0u8; TCP_BUF_SIZE]);
                         let mut sock = tcp::Socket::new(rx_buf, tx_buf);
@@ -263,8 +279,12 @@ pub async fn run(tun_fd: RawFd, config: AppConfig, mut shutdown: tokio::sync::wa
 
                             let join_handle = tokio::spawn(async move {
                                 let conn: Box<dyn ProxyConnector> = match proxy_type {
-                                    ProxyType::Socks5 => Box::new(Socks5Connector::new(proxy_addr, proxy_auth)),
-                                    ProxyType::Http => Box::new(HttpConnector::new(proxy_addr, proxy_auth)),
+                                    ProxyType::Socks5 => {
+                                        Box::new(Socks5Connector::new(proxy_addr, proxy_auth))
+                                    }
+                                    ProxyType::Http => {
+                                        Box::new(HttpConnector::new(proxy_addr, proxy_auth))
+                                    }
                                 };
                                 conn.connect(&target).await
                             });
@@ -464,8 +484,7 @@ impl<T> JoinHandlePoll for tokio::task::JoinHandle<T> {
             fn clone(p: *const ()) -> RawWaker {
                 RawWaker::new(p, &VTABLE)
             }
-            const VTABLE: RawWakerVTable =
-                RawWakerVTable::new(clone, no_op, no_op, no_op);
+            const VTABLE: RawWakerVTable = RawWakerVTable::new(clone, no_op, no_op, no_op);
             RawWaker::new(std::ptr::null(), &VTABLE)
         }
 

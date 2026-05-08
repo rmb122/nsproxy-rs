@@ -9,7 +9,7 @@ mod tun;
 use std::ffi::CString;
 use std::os::unix::io::{AsRawFd, BorrowedFd, RawFd};
 
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result, bail};
 use clap::Parser;
 use nix::sys::socket::{AddressFamily, SockFlag, SockType, socketpair};
 use nix::sys::wait::{WaitStatus, waitpid};
@@ -79,7 +79,11 @@ fn main() -> Result<()> {
         .init();
 
     // --- build Config --------------------------------------------------------
-    let proxy_type = if cli.http { ProxyType::Http } else { ProxyType::Socks5 };
+    let proxy_type = if cli.http {
+        ProxyType::Http
+    } else {
+        ProxyType::Socks5
+    };
 
     let proxy_addr: std::net::SocketAddr = format!("{}:{}", cli.server, cli.port)
         .parse()
@@ -127,8 +131,7 @@ fn main() -> Result<()> {
             // Drop the parent-side socket.
             drop(parent_sock);
 
-            child_main(child_sock_fd, &config)
-                .expect("child_main failed");
+            child_main(child_sock_fd, &config).expect("child_main failed");
 
             // Unreachable after execvp, but keeps the type-checker happy.
             std::process::exit(1);
@@ -202,11 +205,7 @@ fn exec_command(command: &[String]) -> Result<()> {
 
 // ── Parent logic ─────────────────────────────────────────────────────────────
 
-fn parent_main(
-    sock: RawFd,
-    child: nix::unistd::Pid,
-    config: Config,
-) -> Result<()> {
+fn parent_main(sock: RawFd, child: nix::unistd::Pid, config: Config) -> Result<()> {
     tracing::debug!("parent: waiting for TUN fd from child");
 
     // 1. Receive the TUN fd from the child.
@@ -267,12 +266,7 @@ fn parent_main(
         let _ = shutdown_tx.send(true);
 
         // Wait for event loop to finish (with a timeout).
-        match tokio::time::timeout(
-            std::time::Duration::from_secs(2),
-            event_loop_handle,
-        )
-        .await
-        {
+        match tokio::time::timeout(std::time::Duration::from_secs(2), event_loop_handle).await {
             Ok(Ok(Ok(()))) => {
                 tracing::debug!("event loop exited cleanly");
             }

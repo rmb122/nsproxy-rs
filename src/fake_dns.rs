@@ -240,7 +240,10 @@ mod tests {
         let mut dns = FakeDns::new();
         let ip1 = dns.resolve("example.com");
         let ip2 = dns.resolve("example.com");
-        assert_eq!(ip1, ip2, "resolving the same domain twice must return the same IP");
+        assert_eq!(
+            ip1, ip2,
+            "resolving the same domain twice must return the same IP"
+        );
     }
 
     #[test]
@@ -384,16 +387,36 @@ mod tests {
         let ip = Ipv4Addr::new(198, 18, 0, 42);
         let resp = build_a_response(id, "test.example.com", ip);
 
-        assert_eq!(u16::from_be_bytes([resp[0], resp[1]]), id, "ID must be echoed");
+        assert_eq!(
+            u16::from_be_bytes([resp[0], resp[1]]),
+            id,
+            "ID must be echoed"
+        );
         assert_eq!(
             u16::from_be_bytes([resp[2], resp[3]]),
             0x8180,
             "flags must be 0x8180"
         );
-        assert_eq!(u16::from_be_bytes([resp[4], resp[5]]), 1, "QDCOUNT must be 1");
-        assert_eq!(u16::from_be_bytes([resp[6], resp[7]]), 1, "ANCOUNT must be 1");
-        assert_eq!(u16::from_be_bytes([resp[8], resp[9]]), 0, "NSCOUNT must be 0");
-        assert_eq!(u16::from_be_bytes([resp[10], resp[11]]), 0, "ARCOUNT must be 0");
+        assert_eq!(
+            u16::from_be_bytes([resp[4], resp[5]]),
+            1,
+            "QDCOUNT must be 1"
+        );
+        assert_eq!(
+            u16::from_be_bytes([resp[6], resp[7]]),
+            1,
+            "ANCOUNT must be 1"
+        );
+        assert_eq!(
+            u16::from_be_bytes([resp[8], resp[9]]),
+            0,
+            "NSCOUNT must be 0"
+        );
+        assert_eq!(
+            u16::from_be_bytes([resp[10], resp[11]]),
+            0,
+            "ARCOUNT must be 0"
+        );
     }
 
     #[test]
@@ -402,7 +425,11 @@ mod tests {
         let resp = build_a_response(0x0001, "a.b.c", ip);
         // Last 4 bytes of the answer section are the IPv4 RDATA.
         let n = resp.len();
-        assert_eq!(&resp[n - 4..], &ip.octets(), "RDATA must contain the fake IP");
+        assert_eq!(
+            &resp[n - 4..],
+            &ip.octets(),
+            "RDATA must contain the fake IP"
+        );
     }
 
     #[test]
@@ -431,7 +458,11 @@ mod tests {
 
         assert_eq!(u16::from_be_bytes([resp[0], resp[1]]), id);
         assert_eq!(u16::from_be_bytes([resp[2], resp[3]]), 0x8180);
-        assert_eq!(u16::from_be_bytes([resp[4], resp[5]]), 1, "QDCOUNT must be 1");
+        assert_eq!(
+            u16::from_be_bytes([resp[4], resp[5]]),
+            1,
+            "QDCOUNT must be 1"
+        );
         assert_eq!(
             u16::from_be_bytes([resp[6], resp[7]]),
             0,
@@ -446,7 +477,10 @@ mod tests {
         let qname_len: usize = 1 + 7 + 1 + 3 + 1; // "example.com"
         let qtype_offset = 12 + qname_len;
         let echoed_qtype = u16::from_be_bytes([resp[qtype_offset], resp[qtype_offset + 1]]);
-        assert_eq!(echoed_qtype, 28, "QTYPE in question section must match input");
+        assert_eq!(
+            echoed_qtype, 28,
+            "QTYPE in question section must match input"
+        );
     }
 
     #[test]

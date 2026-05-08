@@ -6,7 +6,7 @@
 ///   - Domain names are forwarded verbatim to prevent DNS leaks
 use std::net::{IpAddr, SocketAddr};
 
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result, bail};
 use async_trait::async_trait;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
@@ -224,14 +224,16 @@ async fn send_connect_request(stream: &mut TcpStream, target: &ProxyTarget) -> R
         .context("SOCKS5: read CONNECT reply header")?;
 
     if hdr[0] != SOCKS5_VERSION {
-        bail!(
-            "SOCKS5: unexpected version in reply 0x{:02X}",
-            hdr[0]
-        );
+        bail!("SOCKS5: unexpected version in reply 0x{:02X}", hdr[0]);
     }
     if hdr[1] != REP_SUCCESS {
         let msg = socks5_reply_message(hdr[1]);
-        bail!("SOCKS5: CONNECT to {} failed: {} (0x{:02X})", target, msg, hdr[1]);
+        bail!(
+            "SOCKS5: CONNECT to {} failed: {} (0x{:02X})",
+            target,
+            msg,
+            hdr[1]
+        );
     }
 
     // Skip BND.ADDR + BND.PORT (we don't need them).

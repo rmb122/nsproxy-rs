@@ -10,8 +10,8 @@ use std::fs;
 use std::os::unix::io::RawFd;
 use std::process::Command;
 
-use anyhow::{bail, Context, Result};
-use nix::sched::{unshare, CloneFlags};
+use anyhow::{Context, Result, bail};
+use nix::sched::{CloneFlags, unshare};
 use nix::unistd::{getgid, getuid};
 
 // ── TUNSETIFF constants (architecture-aware, same logic as smoltcp) ──────────
@@ -81,23 +81,16 @@ pub fn create_namespace() -> Result<()> {
                 .write(true)
                 .open("/proc/self/setgroups")
                 .context("open /proc/self/setgroups")?;
-            f.write_all(b"deny")
-                .context("write /proc/self/setgroups")?;
+            f.write_all(b"deny").context("write /proc/self/setgroups")?;
             drop(f);
 
             // Write uid_map: "<uid> <uid> 1" (map real uid to itself)
-            fs::write(
-                "/proc/self/uid_map",
-                format!("{} {} 1\n", uid, uid),
-            )
-            .context("write /proc/self/uid_map")?;
+            fs::write("/proc/self/uid_map", format!("{} {} 1\n", uid, uid))
+                .context("write /proc/self/uid_map")?;
 
             // Write gid_map: "<gid> <gid> 1"
-            fs::write(
-                "/proc/self/gid_map",
-                format!("{} {} 1\n", gid, gid),
-            )
-            .context("write /proc/self/gid_map")?;
+            fs::write("/proc/self/gid_map", format!("{} {} 1\n", gid, gid))
+                .context("write /proc/self/gid_map")?;
 
             tracing::debug!("user+net namespace created (uid={uid}, gid={gid})");
             Ok(())
@@ -114,8 +107,7 @@ pub fn setup_mount_namespace() -> Result<()> {
 
     // Write a temporary resolv.conf
     let tmp_resolv = "/tmp/nsproxy-resolv.conf";
-    fs::write(tmp_resolv, "nameserver 172.23.255.254\n")
-        .context("write temp resolv.conf")?;
+    fs::write(tmp_resolv, "nameserver 172.23.255.254\n").context("write temp resolv.conf")?;
 
     // Bind-mount it over /etc/resolv.conf
     nix::mount::mount(
@@ -135,8 +127,7 @@ pub fn setup_mount_namespace() -> Result<()> {
 
 /// Bring up the loopback interface inside the new network namespace.
 pub fn bringup_loopback() -> Result<()> {
-    run_cmd("ip", &["link", "set", "lo", "up"])
-        .context("bring up loopback")?;
+    run_cmd("ip", &["link", "set", "lo", "up"]).context("bring up loopback")?;
     tracing::debug!("loopback up");
     Ok(())
 }
@@ -160,8 +151,7 @@ pub fn create_tun() -> Result<RawFd> {
             libc::O_RDWR,
         );
         if fd == -1 {
-            return Err(std::io::Error::last_os_error())
-                .context("open /dev/net/tun");
+            return Err(std::io::Error::last_os_error()).context("open /dev/net/tun");
         }
         fd
     };
@@ -183,8 +173,7 @@ pub fn create_tun() -> Result<RawFd> {
     run_cmd("ip", &["addr", "add", "172.23.255.255/31", "dev", "tun0"])
         .context("ip addr add tun0")?;
 
-    run_cmd("ip", &["link", "set", "tun0", "mtu", "65000", "up"])
-        .context("ip link set tun0 up")?;
+    run_cmd("ip", &["link", "set", "tun0", "mtu", "65000", "up"]).context("ip link set tun0 up")?;
 
     // Default route through the virtual gateway
     run_cmd("ip", &["route", "add", "default", "via", "172.23.255.254"])
