@@ -7,7 +7,7 @@ mod proxy;
 mod tun;
 
 use std::ffi::CString;
-use std::os::unix::io::{AsRawFd, BorrowedFd, RawFd};
+use std::os::unix::io::{BorrowedFd, IntoRawFd, RawFd};
 
 use anyhow::{Context, Result, bail};
 use clap::Parser;
@@ -120,8 +120,10 @@ fn main() -> Result<()> {
     )
     .context("socketpair")?;
 
-    let parent_sock_fd: RawFd = parent_sock.as_raw_fd();
-    let child_sock_fd: RawFd = child_sock.as_raw_fd();
+    // Take ownership of the raw fds so OwnedFd won't auto-close them.
+    // We manage their lifetime manually.
+    let parent_sock_fd: RawFd = parent_sock.into_raw_fd();
+    let child_sock_fd: RawFd = child_sock.into_raw_fd();
 
     // --- fork ----------------------------------------------------------------
     // SAFETY: fork() is safe here — we are single-threaded at this point (no
@@ -131,8 +133,8 @@ fn main() -> Result<()> {
     match fork_result {
         // ── Child ─────────────────────────────────────────────────────────
         ForkResult::Child => {
-            // Drop the parent-side socket.
-            drop(parent_sock);
+            // Close the parent-side socket in this process.
+            let _ = close(parent_sock_fd);
 
             if let Err(e) = child_main(child_sock_fd, &config) {
                 eprintln!("nsproxy-rs: {:#}", e);
@@ -145,8 +147,8 @@ fn main() -> Result<()> {
 
         // ── Parent ────────────────────────────────────────────────────────
         ForkResult::Parent { child } => {
-            // Drop the child-side socket.
-            drop(child_sock);
+            // Close the child-side socket in this process.
+            let _ = close(child_sock_fd);
 
             parent_main(parent_sock_fd, child, config)?;
             Ok(())
