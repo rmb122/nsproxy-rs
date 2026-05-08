@@ -53,9 +53,18 @@ enum TcpForwardState {
     /// The TCP handshake completed in smoltcp; we're connecting to the proxy.
     Connecting(tokio::task::JoinHandle<Result<ProxyStream>>),
     /// Proxy connection established; shuttling data.
-    Established(ProxyStream),
+    Established(TcpForwardCtx),
     /// Connection is closing; we're draining.
     Closing,
+}
+
+/// Context for an established TCP forwarding connection.
+struct TcpForwardCtx {
+    stream: ProxyStream,
+    /// Data read from proxy, waiting to be written to smoltcp socket.
+    proxy_to_app: Vec<u8>,
+    /// Data read from smoltcp socket, waiting to be written to proxy.
+    app_to_proxy: Vec<u8>,
 }
 
 // ── Public entry point ───────────────────────────────────────────────────────
@@ -139,7 +148,6 @@ pub async fn run(
     let async_fd = AsyncFd::new(RawFdWrapper(tun_fd)).context("AsyncFd::new for TUN fd")?;
 
     // --- Main loop ---
-    let mut poll_buf = vec![0u8; TCP_BUF_SIZE];
 
     loop {
         // Check shutdown.
@@ -355,7 +363,11 @@ pub async fn run(
                     match (&mut jh).try_poll() {
                         Some(Ok(Ok(stream))) => {
                             tracing::debug!("proxy connection established for socket {handle}");
-                            tcp_states.insert(handle, TcpForwardState::Established(stream));
+                            tcp_states.insert(handle, TcpForwardState::Established(TcpForwardCtx {
+                                stream,
+                                proxy_to_app: Vec::new(),
+                                app_to_proxy: Vec::new(),
+                            }));
                         }
                         Some(Ok(Err(e))) => {
                             tracing::warn!("proxy connect failed: {e:#}");
@@ -394,51 +406,68 @@ pub async fn run(
 
             for handle in established_handles {
                 let state = tcp_states.get_mut(&handle).unwrap();
-                let stream = match state {
-                    TcpForwardState::Established(s) => s,
+                let ctx = match state {
+                    TcpForwardState::Established(c) => c,
                     _ => continue,
                 };
 
                 let sock = sockets.get_mut::<tcp::Socket>(handle);
 
-                // smoltcp → proxy: read from smoltcp socket, write to proxy stream.
-                if sock.can_recv() {
-                    match sock.recv_slice(&mut poll_buf) {
+                // --- App → Proxy direction ---
+                // 1. Read from smoltcp into app_to_proxy buffer (if buffer has space)
+                if sock.can_recv() && ctx.app_to_proxy.len() < TCP_BUF_SIZE {
+                    let space = TCP_BUF_SIZE - ctx.app_to_proxy.len();
+                    let mut tmp = vec![0u8; space];
+                    match sock.recv_slice(&mut tmp) {
                         Ok(n) if n > 0 => {
-                            match stream.inner.try_write(&poll_buf[..n]) {
-                                Ok(_written) => {}
-                                Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                                    // Can't write now — we'll try again next iteration.
-                                    // Ideally we'd buffer, but for now just drop.
-                                    // Actually, let's not recv if we can't write. Push back isn't
-                                    // possible with smoltcp, so this is best-effort.
-                                }
-                                Err(e) => {
-                                    tracing::debug!("proxy write error: {e}");
-                                    sock.close();
-                                }
-                            }
+                            ctx.app_to_proxy.extend_from_slice(&tmp[..n]);
                         }
                         _ => {}
                     }
                 }
+                // 2. Drain app_to_proxy buffer into proxy stream
+                if !ctx.app_to_proxy.is_empty() {
+                    match ctx.stream.inner.try_write(&ctx.app_to_proxy) {
+                        Ok(n) => {
+                            ctx.app_to_proxy.drain(..n);
+                        }
+                        Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
+                        Err(e) => {
+                            tracing::debug!("proxy write error: {e}");
+                            sock.close();
+                        }
+                    }
+                }
 
-                // proxy → smoltcp: read from proxy stream, write to smoltcp socket.
-                if sock.can_send() {
-                    match stream.inner.try_read(&mut poll_buf) {
+                // --- Proxy → App direction ---
+                // 1. Read from proxy into proxy_to_app buffer (if buffer has space)
+                if ctx.proxy_to_app.len() < TCP_BUF_SIZE {
+                    let space = TCP_BUF_SIZE - ctx.proxy_to_app.len();
+                    let mut tmp = vec![0u8; space];
+                    match ctx.stream.inner.try_read(&mut tmp) {
                         Ok(0) => {
-                            // Proxy closed.
+                            // Proxy EOF
                             tracing::debug!("proxy stream closed for socket {handle}");
                             sock.close();
                         }
                         Ok(n) => {
-                            let _ = sock.send_slice(&poll_buf[..n]);
+                            ctx.proxy_to_app.extend_from_slice(&tmp[..n]);
                         }
-                        Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                            // No data available yet.
-                        }
+                        Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
                         Err(e) => {
                             tracing::debug!("proxy read error: {e}");
+                            sock.close();
+                        }
+                    }
+                }
+                // 2. Drain proxy_to_app buffer into smoltcp socket
+                if !ctx.proxy_to_app.is_empty() && sock.can_send() {
+                    match sock.send_slice(&ctx.proxy_to_app) {
+                        Ok(n) => {
+                            ctx.proxy_to_app.drain(..n);
+                        }
+                        Err(_) => {
+                            tracing::debug!("smoltcp send error for socket {handle}");
                             sock.close();
                         }
                     }
