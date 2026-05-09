@@ -27,10 +27,6 @@ use crate::tun::{TunDevice, parse_tcp_syn};
 
 // ── Constants ────────────────────────────────────────────────────────────────
 
-/// The IP address assigned to the TUN interface inside the namespace.
-/// Matches what namespace.rs configures: 172.23.255.255/31.
-#[allow(dead_code)]
-const TUN_ADDR: Ipv4Addr = Ipv4Addr::new(172, 23, 255, 255);
 /// The gateway IP (our side of the TUN) — smoltcp's interface address.
 const TUN_GW: Ipv4Addr = Ipv4Addr::new(172, 23, 255, 254);
 /// DNS server IP that resolv.conf points to (same as gateway).

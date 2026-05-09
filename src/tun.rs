@@ -52,11 +52,6 @@ impl TunDevice {
         })
     }
 
-    #[allow(dead_code)]
-    pub fn fd(&self) -> RawFd {
-        self.fd
-    }
-
     /// Perform a non-blocking read from the TUN fd and push any received packet
     /// into `rx_queue`. Returns `true` if a packet was read.
     pub fn poll_read(&mut self) -> bool {
@@ -70,12 +65,6 @@ impl TunDevice {
         buf.truncate(n as usize);
         self.rx_queue.push_back(buf);
         true
-    }
-
-    /// Peek at the front packet in the rx queue without consuming it.
-    #[allow(dead_code)]
-    pub fn peek_front(&self) -> Option<&[u8]> {
-        self.rx_queue.front().map(|v| v.as_slice())
     }
 
     /// Access the entire rx_queue for inspection (e.g. SYN detection).
@@ -183,29 +172,4 @@ pub fn parse_tcp_syn(packet: &[u8]) -> Option<(Ipv4Addr, u16, Ipv4Addr, u16)> {
     let dst_ip = Ipv4Addr::new(packet[16], packet[17], packet[18], packet[19]);
     let dst_port = u16::from_be_bytes([packet[tcp_offset + 2], packet[tcp_offset + 3]]);
     Some((src_ip, src_port, dst_ip, dst_port))
-}
-
-/// Parse an IPv4 UDP packet and return `(dst_ip, dst_port)`.
-///
-/// Returns `None` if the packet is not IPv4 UDP.
-#[allow(dead_code)]
-pub fn parse_udp_dst(packet: &[u8]) -> Option<(Ipv4Addr, u16)> {
-    if packet.len() < 28 {
-        return None;
-    } // min IP(20) + UDP(8)
-    let version = packet[0] >> 4;
-    if version != 4 {
-        return None;
-    }
-    let ihl = (packet[0] & 0x0f) as usize * 4;
-    let protocol = packet[9];
-    if protocol != 17 {
-        return None;
-    } // not UDP
-    if packet.len() < ihl + 8 {
-        return None;
-    }
-    let dst_ip = Ipv4Addr::new(packet[16], packet[17], packet[18], packet[19]);
-    let dst_port = u16::from_be_bytes([packet[ihl + 2], packet[ihl + 3]]);
-    Some((dst_ip, dst_port))
 }
