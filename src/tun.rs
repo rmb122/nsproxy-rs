@@ -14,8 +14,10 @@ use std::os::unix::io::RawFd;
 use smoltcp::phy::{Device, DeviceCapabilities, Medium, RxToken, TxToken};
 use smoltcp::time::Instant;
 
-/// Maximum transmission unit for the TUN device.
-const MTU: usize = 65000;
+use crate::config::net::TUN_MTU;
+
+/// Maximum transmission unit for the TUN device (from the shared net config).
+const MTU: usize = TUN_MTU as usize;
 
 // ── TunDevice ────────────────────────────────────────────────────────────────
 

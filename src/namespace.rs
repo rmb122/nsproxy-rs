@@ -11,6 +11,8 @@ use std::os::unix::io::RawFd;
 use anyhow::{Context, Result};
 use nix::sched::{CloneFlags, unshare};
 
+use crate::config::net::{DNS_ADDR, TUN_ADDR, TUN_GW, TUN_MTU, TUN_NAME, TUN_PREFIX};
+
 // ── TUNSETIFF constants (architecture-aware, same logic as smoltcp) ──────────
 
 const TUNSETIFF: libc::c_ulong = if cfg!(any(
@@ -115,7 +117,7 @@ pub fn write_id_maps(child_pid: u32, uid: u32, gid: u32) -> Result<()> {
 // ── Mount namespace + resolv.conf ────────────────────────────────────────────
 
 /// Create a private mount namespace and bind-mount custom `resolv.conf` and
-/// `nsswitch.conf` to force DNS through our fake resolver at 172.23.255.254.
+/// `nsswitch.conf` to force DNS through our fake resolver.
 pub fn setup_mount_namespace() -> Result<()> {
     unshare(CloneFlags::CLONE_NEWNS).context("unshare(CLONE_NEWNS)")?;
 
@@ -131,7 +133,8 @@ pub fn setup_mount_namespace() -> Result<()> {
 
     // Create temp files with random names, bind-mount them, then unlink.
     // The mount keeps the inode alive even after unlink (no leftover files).
-    bind_mount_tmpfile("nameserver 172.23.255.254\n", "/etc/resolv.conf")
+    let resolv_conf = format!("nameserver {}\n", DNS_ADDR);
+    bind_mount_tmpfile(&resolv_conf, "/etc/resolv.conf")
         .context("bind-mount resolv.conf")?;
 
     bind_mount_tmpfile("hosts: files dns\n", "/etc/nsswitch.conf")
@@ -148,7 +151,7 @@ pub fn setup_mount_namespace() -> Result<()> {
         None::<&str>,
     );
 
-    tracing::debug!("mount namespace set up; DNS → 172.23.255.254");
+    tracing::debug!("mount namespace set up; DNS → {}", DNS_ADDR);
     Ok(())
 }
 
@@ -243,16 +246,40 @@ pub fn bringup_loopback() -> Result<()> {
 
 // ── TUN device ───────────────────────────────────────────────────────────────
 
-/// Create and configure the `tun0` TUN device.
+/// Compute a /prefix-length netmask as 4 big-endian octets.
+///
+/// E.g. `netmask_octets(31) == [255, 255, 255, 254]`.
+const fn netmask_octets(prefix: u8) -> [u8; 4] {
+    let mask: u32 = if prefix == 0 {
+        0
+    } else {
+        u32::MAX << (32 - prefix as u32)
+    };
+    mask.to_be_bytes()
+}
+
+/// Create and configure the TUN device inside the namespace.
 ///
 /// Returns the raw file descriptor of the open `/dev/net/tun` handle.
 /// The caller is responsible for passing this fd to the parent process.
 ///
-/// Configuration applied:
-///   - IP:  172.23.255.255/31
-///   - MTU: 65000
-///   - Default route via 172.23.255.254
+/// All network parameters (name, IP, netmask, MTU, gateway) come from
+/// [`crate::config::net`].
 pub fn create_tun() -> Result<RawFd> {
+    // Null-terminated, libc-compatible interface name.
+    // IF_NAMESIZE includes the terminating NUL, so the name itself is
+    // bounded by IF_NAMESIZE - 1 bytes. Linux's maximum is 15 chars.
+    if TUN_NAME.len() >= libc::IF_NAMESIZE {
+        anyhow::bail!(
+            "configured TUN_NAME {:?} exceeds IF_NAMESIZE ({})",
+            TUN_NAME,
+            libc::IF_NAMESIZE
+        );
+    }
+    let mut name_buf = [0u8; libc::IF_NAMESIZE];
+    name_buf[..TUN_NAME.len()].copy_from_slice(TUN_NAME.as_bytes());
+    // Trailing NUL already in place from zero-init.
+
     // Open /dev/net/tun
     let fd = unsafe {
         let fd = libc::open(c"/dev/net/tun".as_ptr(), libc::O_RDWR);
@@ -263,7 +290,7 @@ pub fn create_tun() -> Result<RawFd> {
     };
 
     // TUNSETIFF — request a TUN (not TAP) device, no packet info header
-    let mut ifr = ifreq_for("tun0");
+    let mut ifr = ifreq_for(TUN_NAME);
     ifr.ifr_data = IFF_TUN | IFF_NO_PI;
 
     let ret = unsafe { libc::ioctl(fd, TUNSETIFF as _, &mut ifr as *mut Ifreq) };
@@ -273,9 +300,10 @@ pub fn create_tun() -> Result<RawFd> {
         return Err(e).context("ioctl TUNSETIFF");
     }
 
-    tracing::debug!("tun0 created (fd={fd})");
+    tracing::debug!("{} created (fd={fd})", TUN_NAME);
 
-    // Configure tun0 using ioctls (ip command uses RTNETLINK which may fail in user ns)
+    // Configure the TUN interface via ioctls. The `ip` command uses RTNETLINK
+    // which may fail inside a user namespace.
     unsafe {
         let sock = libc::socket(libc::AF_INET, libc::SOCK_DGRAM | libc::SOCK_CLOEXEC, 0);
         if sock < 0 {
@@ -287,65 +315,65 @@ pub fn create_tun() -> Result<RawFd> {
         }
 
         let mut ifr: libc::ifreq = std::mem::zeroed();
-        let name = b"tun0\0";
         std::ptr::copy_nonoverlapping(
-            name.as_ptr(),
+            name_buf.as_ptr(),
             ifr.ifr_name.as_mut_ptr() as *mut u8,
-            name.len(),
+            name_buf.len(),
         );
 
         // Set MTU
-        ifr.ifr_ifru.ifru_mtu = 65000;
+        ifr.ifr_ifru.ifru_mtu = TUN_MTU as libc::c_int;
         if libc::ioctl(sock, libc::SIOCSIFMTU as _, &ifr as *const _) < 0 {
             libc::close(sock);
             libc::close(fd);
             anyhow::bail!("ioctl SIOCSIFMTU: {}", std::io::Error::last_os_error());
         }
 
-        // Set IP address: 172.23.255.255
+        // Set IP address
         let mut addr_ifr: libc::ifreq = std::mem::zeroed();
         std::ptr::copy_nonoverlapping(
-            name.as_ptr(),
+            name_buf.as_ptr(),
             addr_ifr.ifr_name.as_mut_ptr() as *mut u8,
-            name.len(),
+            name_buf.len(),
         );
         let sin = &mut addr_ifr.ifr_ifru.ifru_addr as *mut libc::sockaddr as *mut libc::sockaddr_in;
         (*sin).sin_family = libc::AF_INET as u16;
-        (*sin).sin_addr.s_addr = u32::from_be_bytes([172, 23, 255, 255]).to_be();
+        (*sin).sin_addr.s_addr = u32::from_be_bytes(TUN_ADDR.octets()).to_be();
         if libc::ioctl(sock, libc::SIOCSIFADDR as _, &addr_ifr as *const _) < 0 {
             libc::close(sock);
             libc::close(fd);
             anyhow::bail!("ioctl SIOCSIFADDR: {}", std::io::Error::last_os_error());
         }
 
-        // Set netmask: 255.255.255.254 (/31)
+        // Set netmask (computed from TUN_PREFIX)
         let mut mask_ifr: libc::ifreq = std::mem::zeroed();
         std::ptr::copy_nonoverlapping(
-            name.as_ptr(),
+            name_buf.as_ptr(),
             mask_ifr.ifr_name.as_mut_ptr() as *mut u8,
-            name.len(),
+            name_buf.len(),
         );
         let sin = &mut mask_ifr.ifr_ifru.ifru_addr as *mut libc::sockaddr as *mut libc::sockaddr_in;
         (*sin).sin_family = libc::AF_INET as u16;
-        (*sin).sin_addr.s_addr = u32::from_be_bytes([255, 255, 255, 254]).to_be();
+        (*sin).sin_addr.s_addr = u32::from_be_bytes(netmask_octets(TUN_PREFIX)).to_be();
         if libc::ioctl(sock, libc::SIOCSIFNETMASK as _, &mask_ifr as *const _) < 0 {
             libc::close(sock);
             libc::close(fd);
             anyhow::bail!("ioctl SIOCSIFNETMASK: {}", std::io::Error::last_os_error());
         }
 
-        // Bring up tun0
+        // Bring up the interface
         ifr.ifr_ifru.ifru_flags = (libc::IFF_UP | libc::IFF_RUNNING) as i16;
         if libc::ioctl(sock, libc::SIOCSIFFLAGS as _, &ifr as *const _) < 0 {
             libc::close(sock);
             libc::close(fd);
             anyhow::bail!(
-                "ioctl SIOCSIFFLAGS tun0 UP: {}",
+                "ioctl SIOCSIFFLAGS {} UP: {}",
+                TUN_NAME,
                 std::io::Error::last_os_error()
             );
         }
 
-        // Add default route via 172.23.255.254
+        // Add default route via TUN_GW
         let mut route: libc::rtentry = std::mem::zeroed();
         let dst = &mut route.rt_dst as *mut libc::sockaddr as *mut libc::sockaddr_in;
         (*dst).sin_family = libc::AF_INET as u16;
@@ -353,14 +381,14 @@ pub fn create_tun() -> Result<RawFd> {
 
         let gw = &mut route.rt_gateway as *mut libc::sockaddr as *mut libc::sockaddr_in;
         (*gw).sin_family = libc::AF_INET as u16;
-        (*gw).sin_addr.s_addr = u32::from_be_bytes([172, 23, 255, 254]).to_be();
+        (*gw).sin_addr.s_addr = u32::from_be_bytes(TUN_GW.octets()).to_be();
 
         let mask = &mut route.rt_genmask as *mut libc::sockaddr as *mut libc::sockaddr_in;
         (*mask).sin_family = libc::AF_INET as u16;
         (*mask).sin_addr.s_addr = 0; // 0.0.0.0
 
         route.rt_flags = libc::RTF_UP | libc::RTF_GATEWAY;
-        route.rt_dev = name.as_ptr() as *mut i8;
+        route.rt_dev = name_buf.as_ptr() as *mut i8;
 
         if libc::ioctl(sock, libc::SIOCADDRT as _, &route as *const _) < 0 {
             libc::close(sock);
@@ -371,6 +399,13 @@ pub fn create_tun() -> Result<RawFd> {
         libc::close(sock);
     }
 
-    tracing::debug!("tun0 configured: 172.23.255.255/31, mtu 65000, gw 172.23.255.254");
+    tracing::debug!(
+        "{} configured: {}/{}, mtu {}, gw {}",
+        TUN_NAME,
+        TUN_ADDR,
+        TUN_PREFIX,
+        TUN_MTU,
+        TUN_GW
+    );
     Ok(fd)
 }

@@ -18,6 +18,7 @@ use smoltcp::time::Instant as SmolInstant;
 use smoltcp::wire::{HardwareAddress, IpAddress, IpCidr, IpListenEndpoint};
 use tokio::io::unix::AsyncFd;
 
+use crate::config::net::{DNS_ADDR, DNS_PORT, TUN_GW, TUN_PREFIX};
 use crate::config::{Config as AppConfig, ProxyType};
 use crate::fake_dns::{self, FakeDns};
 use crate::proxy::http::HttpConnector;
@@ -26,13 +27,6 @@ use crate::proxy::{ProxyConnector, ProxyStream, ProxyTarget};
 use crate::tun::{TunDevice, parse_tcp_syn};
 
 // ── Constants ────────────────────────────────────────────────────────────────
-
-/// The gateway IP (our side of the TUN) — smoltcp's interface address.
-const TUN_GW: Ipv4Addr = Ipv4Addr::new(172, 23, 255, 254);
-/// DNS server IP that resolv.conf points to (same as gateway).
-const DNS_ADDR: Ipv4Addr = Ipv4Addr::new(172, 23, 255, 254);
-/// DNS port.
-const DNS_PORT: u16 = 53;
 
 /// TCP socket buffer size.
 const TCP_BUF_SIZE: usize = 65536;
@@ -87,10 +81,7 @@ pub async fn run(
     // packets for ANY destination, not just this IP.
     iface.update_ip_addrs(|addrs| {
         addrs
-            .push(IpCidr::new(
-                IpAddress::Ipv4(smoltcp::wire::Ipv4Address::new(172, 23, 255, 254)),
-                31,
-            ))
+            .push(IpCidr::new(IpAddress::Ipv4(TUN_GW), TUN_PREFIX))
             .unwrap();
     });
 

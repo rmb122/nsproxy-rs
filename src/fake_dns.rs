@@ -13,10 +13,10 @@ use std::net::Ipv4Addr;
 // ── Pool constants ────────────────────────────────────────────────────────────
 
 /// First usable address in the pool (198.18.0.1).
-const POOL_START: u32 = (198 << 24) | (18 << 16) | 1;
+const POOL_START: u32 = u32::from_be_bytes([198, 18, 0, 1]);
 
 /// Last usable address in the pool (198.19.255.254).
-const POOL_END: u32 = (198 << 24) | (19 << 16) | (255 << 8) | 254;
+const POOL_END: u32 = u32::from_be_bytes([198, 19, 255, 254]);
 
 /// Total number of usable addresses (131 070).
 const POOL_SIZE: u32 = POOL_END - POOL_START + 1;
