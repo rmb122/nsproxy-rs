@@ -139,18 +139,6 @@ pub async fn run(
     let mut handle_to_endpoint: HashMap<SocketHandle, (Ipv4Addr, u16, Ipv4Addr, u16)> =
         HashMap::new();
 
-    // Build the proxy connector.
-    let _connector: Box<dyn ProxyConnector> = match config.proxy_type {
-        ProxyType::Socks5 => Box::new(Socks5Connector::new(
-            config.proxy_addr,
-            config.proxy_auth.clone(),
-        )),
-        ProxyType::Http => Box::new(HttpConnector::new(
-            config.proxy_addr,
-            config.proxy_auth.clone(),
-        )),
-    };
-
     // Wrap the TUN fd in AsyncFd for readability notifications.
     let async_fd = AsyncFd::new(RawFdWrapper(tun_fd)).context("AsyncFd::new for TUN fd")?;
 
