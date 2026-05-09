@@ -13,7 +13,7 @@ use std::net::Ipv4Addr;
 // ── Pool constants ────────────────────────────────────────────────────────────
 
 /// First usable address in the pool (198.18.0.1).
-const POOL_START: u32 = (198 << 24) | (18 << 16) | (0 << 8) | 1;
+const POOL_START: u32 = (198 << 24) | (18 << 16) | 1;
 
 /// Last usable address in the pool (198.19.255.254).
 const POOL_END: u32 = (198 << 24) | (19 << 16) | (255 << 8) | 254;
@@ -75,7 +75,7 @@ impl FakeDns {
     /// Return `true` iff `ip` falls within the fake-IP pool range.
     pub fn is_fake_ip(&self, ip: Ipv4Addr) -> bool {
         let n = u32::from(ip);
-        n >= POOL_START && n <= POOL_END
+        (POOL_START..=POOL_END).contains(&n)
     }
 }
 

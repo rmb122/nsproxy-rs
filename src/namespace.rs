@@ -255,10 +255,7 @@ pub fn bringup_loopback() -> Result<()> {
 pub fn create_tun() -> Result<RawFd> {
     // Open /dev/net/tun
     let fd = unsafe {
-        let fd = libc::open(
-            b"/dev/net/tun\0".as_ptr() as *const libc::c_char,
-            libc::O_RDWR,
-        );
+        let fd = libc::open(c"/dev/net/tun".as_ptr(), libc::O_RDWR);
         if fd == -1 {
             return Err(std::io::Error::last_os_error()).context("open /dev/net/tun");
         }
@@ -362,7 +359,7 @@ pub fn create_tun() -> Result<RawFd> {
         (*mask).sin_family = libc::AF_INET as u16;
         (*mask).sin_addr.s_addr = 0; // 0.0.0.0
 
-        route.rt_flags = (libc::RTF_UP | libc::RTF_GATEWAY) as u16;
+        route.rt_flags = libc::RTF_UP | libc::RTF_GATEWAY;
         route.rt_dev = name.as_ptr() as *mut i8;
 
         if libc::ioctl(sock, libc::SIOCADDRT as _, &route as *const _) < 0 {

@@ -39,10 +39,10 @@ pub fn recv_fd(sock: RawFd) -> Result<RawFd> {
         .context("recvmsg (recv_fd)")?;
 
     for cmsg in msg.cmsgs()? {
-        if let ControlMessageOwned::ScmRights(fds) = cmsg {
-            if let Some(&fd) = fds.first() {
-                return Ok(fd);
-            }
+        if let ControlMessageOwned::ScmRights(fds) = cmsg
+            && let Some(&fd) = fds.first()
+        {
+            return Ok(fd);
         }
     }
 

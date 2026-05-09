@@ -353,7 +353,7 @@ pub async fn run(
             for handle in connecting_handles {
                 let state = tcp_states.remove(&handle).unwrap();
                 if let TcpForwardState::Connecting(mut jh) = state {
-                    match (&mut jh).try_poll() {
+                    match jh.try_poll() {
                         Some(Ok(Ok(stream))) => {
                             tracing::debug!("proxy connection established for socket {handle}");
                             tcp_states.insert(

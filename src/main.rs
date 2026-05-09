@@ -47,10 +47,11 @@ struct Cli {
     command: Vec<String>,
 }
 
+/// Parsed components of a proxy URL: `(type, address, optional credentials)`.
+type ProxyUrl = (ProxyType, std::net::SocketAddr, Option<(String, String)>);
+
 /// Parse a proxy URL like "socks5://user:pass@host:port" into Config fields.
-fn parse_proxy_url(
-    url: &str,
-) -> Result<(ProxyType, std::net::SocketAddr, Option<(String, String)>)> {
+fn parse_proxy_url(url: &str) -> Result<ProxyUrl> {
     // Determine scheme
     let (proxy_type, rest) = if let Some(rest) = url.strip_prefix("socks5://") {
         (ProxyType::Socks5, rest)
