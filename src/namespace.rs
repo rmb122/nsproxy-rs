@@ -134,8 +134,7 @@ pub fn setup_mount_namespace() -> Result<()> {
     // Create temp files with random names, bind-mount them, then unlink.
     // The mount keeps the inode alive even after unlink (no leftover files).
     let resolv_conf = format!("nameserver {}\n", DNS_ADDR);
-    bind_mount_tmpfile(&resolv_conf, "/etc/resolv.conf")
-        .context("bind-mount resolv.conf")?;
+    bind_mount_tmpfile(&resolv_conf, "/etc/resolv.conf").context("bind-mount resolv.conf")?;
 
     bind_mount_tmpfile("hosts: files dns\n", "/etc/nsswitch.conf")
         .context("bind-mount nsswitch.conf")?;

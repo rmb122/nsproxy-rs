@@ -51,4 +51,3 @@ pub mod net {
     /// fragmentation inside the namespace.
     pub const TUN_MTU: u32 = 65000;
 }
-
