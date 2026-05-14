@@ -20,13 +20,13 @@ use config::{Config, ProxyType};
 
 // ── CLI ───────────────────────────────────────────────────────────────────────
 
-/// nsproxy-rs — run a command inside a dedicated network namespace whose traffic
+/// nsproxy — run a command inside a dedicated network namespace whose traffic
 /// is transparently proxied.
 ///
 /// Examples:
-///   nsproxy-rs curl http://example.com
-///   nsproxy-rs -x socks5://127.0.0.1:1080 curl http://example.com
-///   nsproxy-rs -x http://user:pass@proxy.example.com:8080 wget example.com
+///   nsproxy curl http://example.com
+///   nsproxy -x socks5://127.0.0.1:1080 curl http://example.com
+///   nsproxy -x http://user:pass@proxy.example.com:8080 wget example.com
 #[derive(Parser, Debug)]
 #[command(author, version, about, long_about = None)]
 struct Cli {
@@ -155,7 +155,7 @@ fn main() -> Result<()> {
             let _ = close(parent_sock_fd);
 
             if let Err(e) = child_main(child_sock_fd, &config) {
-                eprintln!("nsproxy-rs: {:#}", e);
+                eprintln!("nsproxy: {:#}", e);
                 std::process::exit(1);
             }
 

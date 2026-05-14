@@ -46,13 +46,13 @@ Build
 
     cargo build --release
 
-The binary will be at `target/release/nsproxy-rs`.
+The binary will be at `target/release/nsproxy`.
 
 
 Usage
 -----
 
-    nsproxy-rs [OPTIONS] <COMMAND>...
+    nsproxy [OPTIONS] <COMMAND>...
 
     Options:
       -x, --proxy <URL>   Proxy URL (default: socks5://127.0.0.1:1080)
@@ -65,10 +65,10 @@ Usage
       http://[user:pass@]host:port
 
     Examples:
-      nsproxy-rs curl http://example.com
-      nsproxy-rs -x socks5://127.0.0.1:1080 curl http://example.com
-      nsproxy-rs -x http://user:pass@proxy:8080 wget http://example.com
-      nsproxy-rs -q ssh user@remote-host
+      nsproxy curl http://example.com
+      nsproxy -x socks5://127.0.0.1:1080 curl http://example.com
+      nsproxy -x http://user:pass@proxy:8080 wget http://example.com
+      nsproxy -q ssh user@remote-host
 
 
 Requirements

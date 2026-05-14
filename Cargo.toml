@@ -3,6 +3,10 @@ name = "nsproxy-rs"
 version = "0.1.0"
 edition = "2024"
 
+[[bin]]
+name = "nsproxy"
+path = "src/main.rs"
+
 [dependencies]
 tokio = { version = "1", features = ["rt-multi-thread", "net", "io-util", "macros", "sync", "signal", "time"] }
 smoltcp = { version = "0.12", default-features = false, features = ["std", "medium-ip", "proto-ipv4", "socket-tcp", "socket-udp", "alloc", "log"] }
