@@ -430,7 +430,6 @@ pub async fn run(
                 // Read from smoltcp rx buffer and write to proxy.
                 // Use recv() callback which gives us only one contiguous slice
                 // (safe with ring buffer), and consume only what we successfully wrote.
-                let mut app_to_proxy_err = false;
                 if sock.may_recv() && sock.can_recv() {
                     let stream_inner = &ctx.stream.inner;
                     let result = sock.recv(|data| {
@@ -446,14 +445,11 @@ pub async fn run(
                     match result {
                         Ok(Err(e)) => {
                             tracing::debug!("proxy write error: {e}");
-                            app_to_proxy_err = true;
+                            sock.abort();
                         }
                         Err(_) => {} // RecvError - socket not in a state to recv
                         _ => {}
                     }
-                }
-                if app_to_proxy_err {
-                    sock.close();
                 }
 
                 // --- Proxy → App direction ---
@@ -492,20 +488,21 @@ pub async fn run(
                             }
                             Err(_) => {
                                 tracing::debug!("smoltcp send error for socket {handle}");
-                                sock.close();
+                                sock.abort();
                             }
                         }
                     }
                 }
 
                 // 3. If proxy is gone and we've flushed everything we buffered,
-                //    close the smoltcp tx side to propagate the FIN to the client.
+                // close whe whole connection, since we don't know how proxy connection is half closing or full closing
                 if ctx.proxy_closed && ctx.proxy_to_app.is_empty() && sock.may_send() {
-                    sock.close();
+                    sock.abort();
                 }
 
                 // Check if smoltcp socket closed.
-                if sock.state() == tcp::State::Closed || sock.state() == tcp::State::TimeWait {
+                if !sock.may_recv() || !sock.may_send() {
+                    sock.abort();
                     tcp_states.insert(handle, TcpForwardState::Closing);
                 }
             }
@@ -525,15 +522,16 @@ pub async fn run(
                 .collect();
 
             for handle in closing_handles {
-                let sock = sockets.get::<tcp::Socket>(handle);
-                if sock.state() == tcp::State::Closed || sock.state() == tcp::State::TimeWait {
-                    if let Some(key) = handle_to_endpoint.remove(&handle) {
-                        listening_endpoints.remove(&key);
-                    }
-                    tcp_states.remove(&handle);
-                    sockets.remove(handle);
-                    tracing::debug!("cleaned up closed socket {handle}");
+                let sock = sockets.get_mut::<tcp::Socket>(handle);
+                // make sure socket closed
+                sock.abort();
+
+                if let Some(key) = handle_to_endpoint.remove(&handle) {
+                    listening_endpoints.remove(&key);
                 }
+                tcp_states.remove(&handle);
+                sockets.remove(handle);
+                tracing::debug!("cleaned up closed socket {handle}");
             }
         }
 
