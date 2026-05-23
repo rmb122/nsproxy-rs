@@ -13,7 +13,7 @@ use anyhow::{Context, Result, bail};
 use clap::Parser;
 use nix::sys::socket::{AddressFamily, SockFlag, SockType, socketpair};
 use nix::sys::wait::{WaitStatus, waitpid};
-use nix::unistd::{ForkResult, close, execvp, fork, read, write};
+use nix::unistd::{ForkResult, Pid, close, execvp, fork, read, write};
 use tracing::Level;
 
 use config::{Config, ProxyType};
@@ -154,13 +154,13 @@ fn main() -> Result<()> {
             // Close the parent-side socket in this process.
             let _ = close(parent_sock_fd);
 
-            if let Err(e) = child_main(child_sock_fd, &config) {
-                eprintln!("nsproxy: {:#}", e);
-                std::process::exit(1);
+            match child_main(child_sock_fd, &config) {
+                Ok(code) => std::process::exit(code),
+                Err(e) => {
+                    eprintln!("nsproxy: {:#}", e);
+                    std::process::exit(1);
+                }
             }
-
-            // Unreachable after execvp, but keeps the type-checker happy.
-            std::process::exit(1);
         }
 
         // ── Parent ────────────────────────────────────────────────────────
@@ -176,7 +176,7 @@ fn main() -> Result<()> {
 
 // ── Child logic ───────────────────────────────────────────────────────────────
 
-fn child_main(sock: RawFd, config: &Config) -> Result<()> {
+fn child_main(sock: RawFd, config: &Config) -> Result<i32> {
     tracing::debug!("child: setting up namespace");
 
     // 1. Enter a new network namespace (with user-ns fallback for non-root).
@@ -212,15 +212,15 @@ fn child_main(sock: RawFd, config: &Config) -> Result<()> {
     tracing::debug!("child: waiting for ready signal from parent");
     let mut ready = [0u8; 1];
     read(sock, &mut ready).context("read ready signal")?;
-    tracing::debug!("child: received ready signal, exec-ing command");
+    tracing::debug!("child: received ready signal, launching command");
 
-    // 9. Close the socket before exec.
+    // 9. Close setup-only fds before launching the user's command.
     let _ = close(sock);
+    let _ = close(tun_fd);
 
-    // 10. exec the user's command.
-    exec_command(&config.command)?;
-
-    unreachable!()
+    // 10. Run the command under a small reaper so forked descendants keep the
+    // proxy alive after the original command process exits.
+    run_command_tree(&config.command).context("run command tree")
 }
 
 /// Replace the current process with the requested command.
@@ -237,6 +237,82 @@ fn exec_command(command: &[String]) -> Result<()> {
 
     execvp(&prog, &args).context("execvp")?;
     unreachable!()
+}
+
+/// Run the requested command and wait for it plus any orphaned descendants.
+fn run_command_tree(command: &[String]) -> Result<i32> {
+    set_child_subreaper().context("set child subreaper")?;
+
+    // SAFETY: still single-threaded in the namespace child; tokio only starts
+    // in the outer parent process.
+    let command_pid = match unsafe { fork() }.context("fork command")? {
+        ForkResult::Child => {
+            if let Err(e) = exec_command(command) {
+                eprintln!("nsproxy: {:#}", e);
+                std::process::exit(1);
+            }
+
+            unreachable!()
+        }
+        ForkResult::Parent { child } => child,
+    };
+
+    wait_for_command_tree(command_pid)
+}
+
+fn set_child_subreaper() -> Result<()> {
+    let rc = unsafe {
+        libc::prctl(
+            libc::PR_SET_CHILD_SUBREAPER,
+            1 as libc::c_ulong,
+            0 as libc::c_ulong,
+            0 as libc::c_ulong,
+            0 as libc::c_ulong,
+        )
+    };
+
+    if rc == -1 {
+        return Err(std::io::Error::last_os_error()).context("prctl(PR_SET_CHILD_SUBREAPER)");
+    }
+
+    Ok(())
+}
+
+fn wait_for_command_tree(command_pid: Pid) -> Result<i32> {
+    let mut command_exit_code = None;
+
+    loop {
+        match waitpid(Pid::from_raw(-1), None) {
+            Ok(WaitStatus::Exited(pid, code)) => {
+                if pid == command_pid {
+                    tracing::info!("child: command exited with code {code}");
+                    command_exit_code = Some(code);
+                } else {
+                    tracing::debug!("child: descendant {pid} exited with code {code}");
+                }
+            }
+            Ok(WaitStatus::Signaled(pid, sig, _)) => {
+                let code = 128 + sig as i32;
+                if pid == command_pid {
+                    tracing::info!("child: command killed by signal {sig}");
+                    command_exit_code = Some(code);
+                } else {
+                    tracing::debug!("child: descendant {pid} killed by signal {sig}");
+                }
+            }
+            Ok(status) => {
+                tracing::debug!("child: process status {status:?}, continuing wait");
+            }
+            Err(nix::errno::Errno::EINTR) => continue,
+            Err(nix::errno::Errno::ECHILD) => {
+                return command_exit_code
+                    .ok_or_else(|| anyhow::anyhow!("command process exited without status"));
+            }
+            Err(e) => {
+                return Err(anyhow::anyhow!("waitpid: {e}"));
+            }
+        }
+    }
 }
 
 // ── Parent logic ─────────────────────────────────────────────────────────────
