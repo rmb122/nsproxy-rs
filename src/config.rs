@@ -27,8 +27,15 @@ impl Config {
     }
 
     /// True iff `ip` matches an IP/CIDR bypass rule.
+    ///
+    /// Accepts an `IpAddr` for caller convenience (the proxy layer uses
+    /// the family-agnostic type), but the bypass engine itself is IPv4-only:
+    /// any IPv6 destination is treated as "no bypass".
     pub fn bypass_ip(&self, ip: IpAddr) -> bool {
-        self.bypass.matches_ip(ip)
+        match ip {
+            IpAddr::V4(v4) => self.bypass.matches_ip(v4),
+            IpAddr::V6(_) => false,
+        }
     }
 }
 

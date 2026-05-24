@@ -4,43 +4,46 @@
 //! data structures so that the per-connection lookup is cheap regardless of
 //! how many rules were supplied.
 //!
-//! - **Exact domain** (`domain:`) → [`HashSet`] for O(1) lookup.
-//! - **Domain regex** (`domain-regex:`) → a single [`regex::RegexSet`]; all
-//!   patterns are matched simultaneously in one DFA pass.
-//! - **IPs / CIDRs** (`ip:`, `cidr:`) → a binary prefix trie per address
-//!   family. Lookup walks at most one bit per level (32 hops for IPv4,
-//!   128 for IPv6), independent of how many rules were inserted.
+//! - **Domains** (both `domain:` and `domain-regex:`) → a single
+//!   [`regex::RegexSet`]. Literal-exact rules from `domain:` are escaped
+//!   and wrapped as `(?i)^…$` so the original case-insensitive,
+//!   anchored semantics are preserved; user-supplied regex from
+//!   `domain-regex:` is taken verbatim. All patterns are matched
+//!   simultaneously in one DFA pass, and the regex crate transparently
+//!   reduces literal alternations to Aho-Corasick under the hood.
+//! - **IPv4 / CIDR** (`ip:`, `cidr:`) → a binary prefix trie. Lookup walks
+//!   at most one bit per level (≤ 32 hops), independent of how many rules
+//!   were inserted. `ip:` is folded into the trie as a `/32` prefix.
 //!
-//! `ip:` is equivalent to a `/32` (or `/128`) CIDR and is folded into the
-//! same trie, so there is exactly one structure for IP-side matching.
+//! Only IPv4 is supported, mirroring the rest of nsproxy-rs (the TUN +
+//! smoltcp + fake-DNS path is IPv4-only). IPv6 inputs in `ip:` / `cidr:`
+//! are rejected at parse time.
 //!
 //! Spec format (one per `--bypass` flag):
 //!
 //! ```text
-//! ip:<address>
-//! cidr:<network>/<prefix>
+//! ip:<ipv4>
+//! cidr:<ipv4>/<prefix>
 //! domain:<host>             (case-insensitive)
 //! domain-regex:<regex>
 //! ```
 
-use std::collections::HashSet;
-use std::net::IpAddr;
+use std::net::Ipv4Addr;
 
 use anyhow::{Context, Result, bail};
 use regex::{Regex, RegexSet};
 
 // ── PrefixTrie ───────────────────────────────────────────────────────────────
 
-/// Binary trie keyed on the most-significant bits of an integer.
+/// Binary prefix trie keyed on the high bits of an IPv4 address.
 ///
-/// The same type is used for both IPv4 (width = 32) and IPv6 (width = 128);
-/// the caller passes the appropriate width.  IPv4 addresses are widened to
-/// `u128` and only the low 32 bits are used.
+/// Each level of the trie corresponds to one bit, walked from the
+/// most-significant (bit 31) down to bit 0. A node is "terminal" iff some
+/// inserted prefix ends here — any address that reaches a terminal node is
+/// considered to match.
 #[derive(Debug, Clone, Default)]
 struct PrefixTrie {
     children: [Option<Box<PrefixTrie>>; 2],
-    /// True iff some prefix terminates at this node, i.e. any address that
-    /// reaches this point is a match.
     terminal: bool,
 }
 
@@ -49,13 +52,12 @@ impl PrefixTrie {
         Self::default()
     }
 
-    /// Insert a network of `prefix` significant bits read from the top of
-    /// `value` (counting from bit `width-1` downwards).
-    fn insert(&mut self, value: u128, prefix: u8, width: u8) {
-        debug_assert!(prefix <= width);
+    /// Insert a network of `prefix` significant high bits of `value`.
+    fn insert(&mut self, value: u32, prefix: u8) {
+        debug_assert!(prefix <= 32);
         let mut node = self;
         for i in 0..prefix {
-            let shift = width - 1 - i;
+            let shift = 31 - i;
             let bit = ((value >> shift) & 1) as usize;
             node = node.children[bit].get_or_insert_with(|| Box::new(PrefixTrie::new()));
         }
@@ -63,13 +65,13 @@ impl PrefixTrie {
     }
 
     /// Return `true` if any inserted prefix matches `value`.
-    fn contains(&self, value: u128, width: u8) -> bool {
+    fn contains(&self, value: u32) -> bool {
         let mut node = self;
         if node.terminal {
             return true;
         }
-        for i in 0..width {
-            let shift = width - 1 - i;
+        for i in 0..32 {
+            let shift = 31 - i;
             let bit = ((value >> shift) & 1) as usize;
             match node.children[bit].as_deref() {
                 Some(child) => {
@@ -91,8 +93,8 @@ impl PrefixTrie {
 /// while building a [`BypassMatcher`]; the final matcher does not retain a
 /// list of these.
 enum BypassRule {
-    Ip(IpAddr),
-    Cidr { network: IpAddr, prefix: u8 },
+    Ip(Ipv4Addr),
+    Cidr { network: Ipv4Addr, prefix: u8 },
     Domain(String),
     DomainRegex(String),
 }
@@ -105,27 +107,25 @@ impl BypassRule {
 
         match kind {
             "ip" => {
-                let addr: IpAddr = value
-                    .parse()
-                    .with_context(|| format!("bypass rule '{spec}': invalid IP"))?;
+                let addr: Ipv4Addr = value.parse().with_context(|| {
+                    format!("bypass rule '{spec}': invalid IPv4 address (IPv6 is not supported)")
+                })?;
                 Ok(BypassRule::Ip(addr))
             }
             "cidr" => {
                 let (net_str, prefix_str) = value
                     .split_once('/')
                     .with_context(|| format!("bypass rule '{spec}': CIDR must be 'addr/prefix'"))?;
-                let network: IpAddr = net_str
-                    .parse()
-                    .with_context(|| format!("bypass rule '{spec}': invalid CIDR network"))?;
+                let network: Ipv4Addr = net_str.parse().with_context(|| {
+                    format!(
+                        "bypass rule '{spec}': invalid IPv4 CIDR network (IPv6 is not supported)"
+                    )
+                })?;
                 let prefix: u8 = prefix_str
                     .parse()
                     .with_context(|| format!("bypass rule '{spec}': invalid CIDR prefix"))?;
-                let max = match network {
-                    IpAddr::V4(_) => 32,
-                    IpAddr::V6(_) => 128,
-                };
-                if prefix > max {
-                    bail!("bypass rule '{spec}': prefix /{prefix} out of range (max /{max})");
+                if prefix > 32 {
+                    bail!("bypass rule '{spec}': prefix /{prefix} out of range (max /32)");
                 }
                 Ok(BypassRule::Cidr { network, prefix })
             }
@@ -133,7 +133,10 @@ impl BypassRule {
                 if value.is_empty() {
                     bail!("bypass rule '{spec}': empty domain");
                 }
-                Ok(BypassRule::Domain(value.to_ascii_lowercase()))
+                // Stored verbatim — case-insensitivity is applied later by
+                // wrapping the escaped pattern with `(?i)` when feeding the
+                // RegexSet.
+                Ok(BypassRule::Domain(value.to_string()))
             }
             "domain-regex" => {
                 // Validate by compiling a single Regex so the user gets a
@@ -158,45 +161,36 @@ impl BypassRule {
 /// (the [`RegexSet`] is internally `Arc`-shared).
 #[derive(Debug, Clone, Default)]
 pub struct BypassMatcher {
-    domains: HashSet<String>,
-    domain_regex_set: Option<RegexSet>,
-    cidr_v4: PrefixTrie,
-    cidr_v6: PrefixTrie,
+    /// Combined matcher for both `domain:` and `domain-regex:` rules.
+    /// Literal domain rules are escaped and wrapped as `(?i)^…$` before
+    /// being added; regex rules are added verbatim.
+    domains: Option<RegexSet>,
+    /// IPv4 CIDR trie. `ip:` rules are stored as /32 prefixes here.
+    cidr: PrefixTrie,
 }
 
 impl BypassMatcher {
     /// Parse a slice of rule specs and build the matcher.
     pub fn from_specs<S: AsRef<str>>(specs: &[S]) -> Result<Self> {
-        let mut domains: HashSet<String> = HashSet::new();
-        let mut regex_patterns: Vec<String> = Vec::new();
-        let mut cidr_v4 = PrefixTrie::new();
-        let mut cidr_v6 = PrefixTrie::new();
+        let mut domain_patterns: Vec<String> = Vec::new();
+        let mut cidr = PrefixTrie::new();
 
         for spec in specs {
             match BypassRule::parse(spec.as_ref())? {
                 BypassRule::Domain(d) => {
-                    domains.insert(d);
+                    // Escape any regex metacharacters so the literal is
+                    // matched verbatim, then anchor with ^…$ and apply the
+                    // (?i) flag to keep DNS-style case-insensitive matching.
+                    domain_patterns.push(format!("(?i)^{}$", regex::escape(&d)));
                 }
                 BypassRule::DomainRegex(s) => {
-                    regex_patterns.push(s);
+                    domain_patterns.push(s);
                 }
-                BypassRule::Ip(IpAddr::V4(v4)) => {
-                    cidr_v4.insert(u128::from(u32::from(v4)), 32, 32);
+                BypassRule::Ip(v4) => {
+                    cidr.insert(u32::from(v4), 32);
                 }
-                BypassRule::Ip(IpAddr::V6(v6)) => {
-                    cidr_v6.insert(u128::from(v6), 128, 128);
-                }
-                BypassRule::Cidr {
-                    network: IpAddr::V4(v4),
-                    prefix,
-                } => {
-                    cidr_v4.insert(u128::from(u32::from(v4)), prefix, 32);
-                }
-                BypassRule::Cidr {
-                    network: IpAddr::V6(v6),
-                    prefix,
-                } => {
-                    cidr_v6.insert(u128::from(v6), prefix, 128);
+                BypassRule::Cidr { network, prefix } => {
+                    cidr.insert(u32::from(network), prefix);
                 }
             }
         }
@@ -204,47 +198,26 @@ impl BypassMatcher {
         // Each pattern was already validated individually above, so this
         // RegexSet build cannot fail for syntax reasons; we still surface
         // any size/limit error.
-        let domain_regex_set = if regex_patterns.is_empty() {
+        let domains = if domain_patterns.is_empty() {
             None
         } else {
-            Some(RegexSet::new(&regex_patterns).context("compile bypass RegexSet")?)
+            Some(RegexSet::new(&domain_patterns).context("compile bypass RegexSet")?)
         };
 
-        Ok(Self {
-            domains,
-            domain_regex_set,
-            cidr_v4,
-            cidr_v6,
-        })
+        Ok(Self { domains, cidr })
     }
 
     /// Match against a host name (e.g. as recovered from a fake-DNS lookup).
     pub fn matches_domain(&self, host: &str) -> bool {
-        if self.domains.is_empty() && self.domain_regex_set.is_none() {
-            return false;
+        match &self.domains {
+            Some(rs) => rs.is_match(host),
+            None => false,
         }
-        // Exact match: lowercase the host and look it up.
-        if !self.domains.is_empty() {
-            let lower = host.to_ascii_lowercase();
-            if self.domains.contains(&lower) {
-                return true;
-            }
-        }
-        // Single DFA pass over all regex patterns.
-        if let Some(rs) = &self.domain_regex_set
-            && rs.is_match(host)
-        {
-            return true;
-        }
-        false
     }
 
-    /// Match against a numeric destination IP.
-    pub fn matches_ip(&self, ip: IpAddr) -> bool {
-        match ip {
-            IpAddr::V4(v4) => self.cidr_v4.contains(u128::from(u32::from(v4)), 32),
-            IpAddr::V6(v6) => self.cidr_v6.contains(u128::from(v6), 128),
-        }
+    /// Match against a numeric IPv4 destination.
+    pub fn matches_ip(&self, ip: Ipv4Addr) -> bool {
+        self.cidr.contains(u32::from(ip))
     }
 }
 
@@ -253,13 +226,9 @@ impl BypassMatcher {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::net::{Ipv4Addr, Ipv6Addr};
 
-    fn v4(s: &str) -> IpAddr {
-        IpAddr::V4(s.parse::<Ipv4Addr>().unwrap())
-    }
-    fn v6(s: &str) -> IpAddr {
-        IpAddr::V6(s.parse::<Ipv6Addr>().unwrap())
+    fn v4(s: &str) -> Ipv4Addr {
+        s.parse::<Ipv4Addr>().unwrap()
     }
 
     // ── parse / matcher round-trips ──────────────────────────────────────
@@ -280,7 +249,7 @@ mod tests {
     }
 
     #[test]
-    fn cidr_rule_v4() {
+    fn cidr_rule() {
         let m = BypassMatcher::from_specs(&["cidr:10.0.0.0/8"]).unwrap();
         assert!(m.matches_ip(v4("10.0.0.1")));
         assert!(m.matches_ip(v4("10.255.255.255")));
@@ -288,13 +257,11 @@ mod tests {
     }
 
     #[test]
-    fn cidr_zero_prefix_matches_everything_in_family() {
+    fn cidr_zero_prefix_matches_every_v4() {
         let m = BypassMatcher::from_specs(&["cidr:0.0.0.0/0"]).unwrap();
         assert!(m.matches_ip(v4("8.8.8.8")));
         assert!(m.matches_ip(v4("0.0.0.0")));
         assert!(m.matches_ip(v4("255.255.255.255")));
-        // v6 trie is empty.
-        assert!(!m.matches_ip(v6("2001:db8::1")));
     }
 
     #[test]
@@ -302,23 +269,6 @@ mod tests {
         let m = BypassMatcher::from_specs(&["cidr:1.2.3.4/32"]).unwrap();
         assert!(m.matches_ip(v4("1.2.3.4")));
         assert!(!m.matches_ip(v4("1.2.3.5")));
-    }
-
-    #[test]
-    fn cidr_v6() {
-        let m = BypassMatcher::from_specs(&["cidr:2001:db8::/32"]).unwrap();
-        assert!(m.matches_ip(v6("2001:db8::1")));
-        assert!(m.matches_ip(v6("2001:db8:ffff::1")));
-        assert!(!m.matches_ip(v6("2001:db9::1")));
-        // v4 trie is empty.
-        assert!(!m.matches_ip(v4("1.2.3.4")));
-    }
-
-    #[test]
-    fn ip_v6_rule() {
-        let m = BypassMatcher::from_specs(&["ip:2001:db8::1"]).unwrap();
-        assert!(m.matches_ip(v6("2001:db8::1")));
-        assert!(!m.matches_ip(v6("2001:db8::2")));
     }
 
     #[test]
@@ -391,24 +341,31 @@ mod tests {
         assert!(BypassMatcher::from_specs(&["domain-regex:["]).is_err());
     }
 
+    #[test]
+    fn rejects_ipv6() {
+        // IPv6 is not supported anywhere in nsproxy-rs.
+        assert!(BypassMatcher::from_specs(&["ip:2001:db8::1"]).is_err());
+        assert!(BypassMatcher::from_specs(&["cidr:2001:db8::/32"]).is_err());
+    }
+
     // ── PrefixTrie low-level ──────────────────────────────────────────────
 
     #[test]
-    fn trie_insert_and_lookup_v4() {
+    fn trie_insert_and_lookup() {
         let mut t = PrefixTrie::new();
         // 192.168.0.0/16
-        t.insert(0xC0A8_0000, 16, 32);
-        assert!(t.contains(0xC0A8_0001, 32));
-        assert!(t.contains(0xC0A8_FFFF, 32));
-        assert!(!t.contains(0xC0A9_0000, 32));
+        t.insert(0xC0A8_0000, 16);
+        assert!(t.contains(0xC0A8_0001));
+        assert!(t.contains(0xC0A8_FFFF));
+        assert!(!t.contains(0xC0A9_0000));
     }
 
     #[test]
     fn trie_terminal_short_circuits() {
         let mut t = PrefixTrie::new();
         // /0 — root becomes terminal, every lookup matches immediately.
-        t.insert(0, 0, 32);
-        assert!(t.contains(0, 32));
-        assert!(t.contains(u32::MAX as u128, 32));
+        t.insert(0, 0);
+        assert!(t.contains(0));
+        assert!(t.contains(u32::MAX));
     }
 }
