@@ -378,6 +378,7 @@ dependencies = [
  "libc",
  "log",
  "nix",
+ "regex",
  "smoltcp",
  "tokio",
  "tracing",

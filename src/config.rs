@@ -1,4 +1,6 @@
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
+
+use crate::bypass::BypassMatcher;
 
 #[derive(Debug, Clone)]
 pub enum ProxyType {
@@ -12,6 +14,22 @@ pub struct Config {
     pub proxy_addr: SocketAddr,
     pub proxy_auth: Option<(String, String)>,
     pub command: Vec<String>,
+    /// Pre-built matcher for `--bypass` rules. Connections whose target
+    /// matches any rule skip the upstream proxy and connect directly from
+    /// the host instead.
+    pub bypass: BypassMatcher,
+}
+
+impl Config {
+    /// True iff `host` matches a domain-side bypass rule.
+    pub fn bypass_domain(&self, host: &str) -> bool {
+        self.bypass.matches_domain(host)
+    }
+
+    /// True iff `ip` matches an IP/CIDR bypass rule.
+    pub fn bypass_ip(&self, ip: IpAddr) -> bool {
+        self.bypass.matches_ip(ip)
+    }
 }
 
 /// Network-layer constants for the namespace. Kept in one place so that

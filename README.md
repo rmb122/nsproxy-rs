@@ -55,10 +55,11 @@ Usage
     nsproxy [OPTIONS] <COMMAND>...
 
     Options:
-      -x, --proxy <URL>   Proxy URL (default: socks5://127.0.0.1:1080)
-      -v, --verbose       Increase verbosity (repeatable)
-      -q, --quiet         Suppress all log output
-      -h, --help          Print help
+      -x, --proxy <URL>    Proxy URL (default: socks5://127.0.0.1:1080)
+      -b, --bypass <RULE>  Bypass rule (repeatable); see "Bypass rules" below
+      -v, --verbose        Increase verbosity (repeatable)
+      -q, --quiet          Suppress all log output
+      -h, --help           Print help
 
     Proxy URL format:
       socks5://[user:pass@]host:port
@@ -69,6 +70,30 @@ Usage
       nsproxy -x socks5://127.0.0.1:1080 curl http://example.com
       nsproxy -x http://user:pass@proxy:8080 wget http://example.com
       nsproxy -q ssh user@remote-host
+      nsproxy -b cidr:10.0.0.0/8 -b domain:example.com curl http://internal
+
+
+Bypass rules
+------------
+
+Connections that match a `--bypass` (`-b`) rule are made directly from the
+host instead of going through the upstream proxy.  The flag is repeatable
+and each value uses one of four prefixes:
+
+      ip:<address>             exact IP match           (e.g.  ip:1.2.3.4)
+      cidr:<network>/<prefix>  CIDR range match         (e.g.  cidr:10.0.0.0/8)
+      domain:<host>            exact domain match       (e.g.  domain:example.com)
+      domain-regex:<regex>     regex match on domain    (e.g.  'domain-regex:.*\.example\.com')
+
+Notes:
+
+- `ip` / `cidr` rules match the destination IP. They take effect when the
+  application connects to a numeric address (no DNS lookup involved).
+- `domain` / `domain-regex` rules match the host name extracted from the
+  intercepted DNS query. Matching is case-insensitive for `domain`.
+- For domain matches the host's resolver is used to resolve the name when
+  making the direct connection, so you are opting in to host-side DNS for
+  those domains.
 
 
 Requirements

@@ -1,3 +1,4 @@
+pub mod direct;
 pub mod http;
 pub mod socks5;
 

@@ -1,3 +1,4 @@
+mod bypass;
 mod config;
 mod event_loop;
 mod fake_dns;
@@ -16,6 +17,7 @@ use nix::sys::wait::{WaitStatus, waitpid};
 use nix::unistd::{ForkResult, Pid, close, execvp, fork, read, write};
 use tracing::Level;
 
+use bypass::BypassMatcher;
 use config::{Config, ProxyType};
 
 // ── CLI ───────────────────────────────────────────────────────────────────────
@@ -27,12 +29,30 @@ use config::{Config, ProxyType};
 ///   nsproxy curl http://example.com
 ///   nsproxy -x socks5://127.0.0.1:1080 curl http://example.com
 ///   nsproxy -x http://user:pass@proxy.example.com:8080 wget example.com
+///   nsproxy -b cidr:10.0.0.0/8 -b domain:example.com curl http://example.com
 #[derive(Parser, Debug)]
 #[command(author, version, about, long_about = None)]
 struct Cli {
     /// Proxy URL: socks5://[user:pass@]host:port or http://[user:pass@]host:port
     #[arg(short = 'x', long = "proxy", default_value = "socks5://127.0.0.1:1080")]
     proxy: String,
+
+    /// Bypass rule — connections matching the rule skip the proxy and go
+    /// directly. Repeatable. Format: `<kind>:<value>` where kind is one of
+    /// `ip`, `cidr`, `domain`, `domain-regex`.
+    ///
+    /// Examples:
+    ///   -b ip:1.2.3.4
+    ///   -b cidr:10.0.0.0/8
+    ///   -b domain:example.com
+    ///   -b 'domain-regex:.*\.example\.com'
+    #[arg(
+        short = 'b',
+        long = "bypass",
+        value_name = "RULE",
+        action = clap::ArgAction::Append
+    )]
+    bypass: Vec<String>,
 
     /// Increase verbosity (may be repeated)
     #[arg(short = 'v', long = "verbose", action = clap::ArgAction::Count)]
@@ -118,11 +138,14 @@ fn main() -> Result<()> {
     // --- build Config --------------------------------------------------------
     let (proxy_type, proxy_addr, proxy_auth) = parse_proxy_url(&cli.proxy)?;
 
+    let bypass = BypassMatcher::from_specs(&cli.bypass).context("parse --bypass rules")?;
+
     let config = Config {
         proxy_type,
         proxy_addr,
         proxy_auth,
         command: cli.command.clone(),
+        bypass,
     };
     tracing::debug!(?config, "parsed configuration");
 
