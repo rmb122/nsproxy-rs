@@ -392,7 +392,7 @@ pub async fn run(
                             // abort the task so it doesn't linger (e.g. a
                             // hung proxy connect waiting on Linux TCP timeout
                             // would otherwise stay pending for minutes).
-                            let sock = sockets.get::<tcp::Socket>(handle);
+                            let sock = sockets.get_mut::<tcp::Socket>(handle);
                             let client_gone = matches!(
                                 sock.state(),
                                 tcp::State::Closed
@@ -408,6 +408,7 @@ pub async fn run(
                                     sock.state()
                                 );
                                 jh.abort();
+                                sock.abort();
                                 tcp_states.insert(handle, TcpForwardState::Closing);
                             } else {
                                 // Still in progress, put it back.
@@ -524,7 +525,23 @@ pub async fn run(
             }
         }
 
-        // 8. Clean up closed connections.
+        // 8. Drive smoltcp so everything queued during this iteration is
+        // actually flushed to the TUN interface:
+        //   - DNS responses queued by `dns_sock.send_slice` in step 5,
+        //   - TCP payload queued by `sock.send_slice` in step 7,
+        //   - RST/FIN queued by `sock.abort()` / `sock.close()` in step 7.
+        //
+        // This MUST run before the cleanup in step 9: smoltcp's
+        // `Socket::abort()` only marks the socket as "needs to send RST",
+        // and the packet is emitted by the next `Interface::poll`. If we
+        // removed the socket from the set first, smoltcp would have nothing
+        // to emit on and the client would never see an RST/FIN — the
+        // application (e.g. curl) would hang waiting for the server.
+        iface.poll(SmolInstant::now(), &mut device, &mut sockets);
+
+        // 9. Clean up closed connections. By this point any RST/FIN they
+        // had pending has already been transmitted by the poll above, so
+        // it is safe to drop them from the set.
         {
             let closing_handles: Vec<SocketHandle> = tcp_states
                 .iter()
@@ -538,10 +555,9 @@ pub async fn run(
                 .collect();
 
             for handle in closing_handles {
-                let sock = sockets.get_mut::<tcp::Socket>(handle);
-                // make sure socket closed
-                sock.abort();
-
+                // Deliberately no abort() here: the socket has already
+                // been driven through poll(); a fresh abort would queue a
+                // *new* RST that would be lost when we remove the socket.
                 if let Some(key) = handle_to_endpoint.remove(&handle) {
                     listening_endpoints.remove(&key);
                 }
@@ -550,9 +566,6 @@ pub async fn run(
                 tracing::debug!("cleaned up closed socket {handle}");
             }
         }
-
-        // Run poll_egress to send any pending responses.
-        iface.poll(SmolInstant::now(), &mut device, &mut sockets);
     }
 
     // Abort any in-flight proxy connect tasks so they don't linger past
