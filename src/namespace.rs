@@ -387,7 +387,7 @@ pub fn create_tun() -> Result<RawFd> {
         (*mask).sin_addr.s_addr = 0; // 0.0.0.0
 
         route.rt_flags = libc::RTF_UP | libc::RTF_GATEWAY;
-        route.rt_dev = name_buf.as_ptr() as *mut i8;
+        route.rt_dev = name_buf.as_ptr() as *mut libc::c_char;
 
         if libc::ioctl(sock, libc::SIOCADDRT as _, &route as *const _) < 0 {
             libc::close(sock);
