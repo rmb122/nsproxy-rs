@@ -1,41 +1,27 @@
-use std::net::{IpAddr, SocketAddr};
+use std::net::IpAddr;
 
-use crate::bypass::BypassMatcher;
-
-#[derive(Debug, Clone)]
-pub enum ProxyType {
-    Socks5,
-    Http,
-}
+use crate::proxy::{ProxyConfig, ProxyTarget};
+use crate::rule::RuleMatcher;
 
 #[derive(Debug, Clone)]
 pub struct Config {
-    pub proxy_type: ProxyType,
-    pub proxy_addr: SocketAddr,
-    pub proxy_auth: Option<(String, String)>,
+    /// Route used when no rule matches the destination.
+    pub default_proxy: ProxyConfig,
     pub command: Vec<String>,
-    /// Pre-built matcher for `--bypass` rules. Connections whose target
-    /// matches any rule skip the upstream proxy and connect directly from
-    /// the host instead.
-    pub bypass: BypassMatcher,
+    pub rules: RuleMatcher,
 }
 
 impl Config {
-    /// True iff `host` matches a domain-side bypass rule.
-    pub fn bypass_domain(&self, host: &str) -> bool {
-        self.bypass.matches_domain(host)
-    }
-
-    /// True iff `ip` matches an IP/CIDR bypass rule.
-    ///
-    /// Accepts an `IpAddr` for caller convenience (the proxy layer uses
-    /// the family-agnostic type), but the bypass engine itself is IPv4-only:
-    /// any IPv6 destination is treated as "no bypass".
-    pub fn bypass_ip(&self, ip: IpAddr) -> bool {
-        match ip {
-            IpAddr::V4(v4) => self.bypass.matches_ip(v4),
-            IpAddr::V6(_) => false,
-        }
+    /// Select the first applicable rule route, or fall back to `-x`.
+    pub fn proxy_for(&self, target: &ProxyTarget) -> &ProxyConfig {
+        let matched = match target {
+            ProxyTarget::Domain { host, .. } => self.rules.match_domain(host),
+            ProxyTarget::Ip { addr, .. } => match addr {
+                IpAddr::V4(v4) => self.rules.match_ip(*v4),
+                IpAddr::V6(_) => None,
+            },
+        };
+        matched.unwrap_or(&self.default_proxy)
     }
 }
 
@@ -75,4 +61,33 @@ pub mod net {
     /// single smoltcp packet can carry a lot of payload without IP
     /// fragmentation inside the namespace.
     pub const TUN_MTU: u32 = 65000;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn matching_rule_overrides_default_and_miss_falls_back() {
+        let config = Config {
+            default_proxy: ProxyConfig::Direct,
+            command: Vec::new(),
+            rules: RuleMatcher::from_specs(&["ip:1.1.1.1=socks5://127.0.0.1:1081"]).unwrap(),
+        };
+
+        let matched = ProxyTarget::Ip {
+            addr: "1.1.1.1".parse().unwrap(),
+            port: 443,
+        };
+        let missed = ProxyTarget::Ip {
+            addr: "8.8.8.8".parse().unwrap(),
+            port: 443,
+        };
+
+        assert!(matches!(
+            config.proxy_for(&matched),
+            ProxyConfig::Socks5 { .. }
+        ));
+        assert_eq!(config.proxy_for(&missed), &ProxyConfig::Direct);
+    }
 }

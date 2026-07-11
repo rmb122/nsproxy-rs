@@ -55,13 +55,14 @@ Usage
     nsproxy [OPTIONS] <COMMAND>...
 
     Options:
-      -x, --proxy <URL>    Proxy URL (default: socks5://127.0.0.1:1080)
-      -b, --bypass <RULE>  Bypass rule (repeatable); see "Bypass rules" below
+      -x, --proxy <PROXY>  Default route (default: socks5://127.0.0.1:1080)
+      -r, --rule <RULE>    Routing rule (repeatable); see "Routing rules" below
       -v, --verbose        Enable log output; repeat for trace-level logs
       -q, --quiet          Suppress all log output
       -h, --help           Print help
 
-    Proxy URL format:
+    Proxy format:
+      direct
       socks5://[user:pass@]host:port
       http://[user:pass@]host:port
 
@@ -69,21 +70,32 @@ Usage
       nsproxy curl http://example.com
       nsproxy -x socks5://127.0.0.1:1080 curl http://example.com
       nsproxy -x http://user:pass@proxy:8080 wget http://example.com
+      nsproxy -x direct -r domain:example.com=socks5://127.0.0.1:1080 curl http://example.com
       nsproxy ssh user@remote-host
-      nsproxy -b cidr:10.0.0.0/8 -b domain:example.com curl http://internal
+      nsproxy -r cidr:10.0.0.0/8=direct curl http://internal
 
 
-Bypass rules
-------------
+Routing rules
+-------------
 
-Connections that match a `--bypass` (`-b`) rule are made directly from the
-host instead of going through the upstream proxy.  The flag is repeatable
-and each value uses one of four prefixes:
+Connections that match a `--rule` (`-r`) rule use the route on the right side
+instead of the default selected by `-x`. The flag is repeatable, and both a
+match and a route are required:
 
-      ip:<address>             exact IP match           (e.g.  ip:1.2.3.4)
-      cidr:<network>/<prefix>  CIDR range match         (e.g.  cidr:10.0.0.0/8)
-      domain:<host>            exact domain match       (e.g.  domain:example.com)
-      domain-regex:<regex>     regex match on domain    (e.g.  'domain-regex:.*\.example\.com')
+      ip:<address>=<proxy>
+      cidr:<network>/<prefix>=<proxy>
+      domain:<host>=<proxy>
+      domain-regex:<regex>=<proxy>
+
+For example:
+
+      -r ip:1.1.1.1=socks5://127.0.0.1:1081
+      -r cidr:10.0.0.0/8=direct
+      -r domain:example.com=http://127.0.0.1:8080
+
+IP and CIDR rules use longest-prefix matching; the first rule wins when two
+matching prefixes have the same length. Domain and domain-regex rules use the
+first matching rule in command-line order.
 
 Notes:
 
@@ -91,9 +103,8 @@ Notes:
   application connects to a numeric address (no DNS lookup involved).
 - `domain` / `domain-regex` rules match the host name extracted from the
   intercepted DNS query. Matching is case-insensitive for `domain`.
-- For domain matches the host's resolver is used to resolve the name when
-  making the direct connection, so you are opting in to host-side DNS for
-  those domains.
+- A `direct` domain route uses the host's resolver, so it opts in to host-side
+  DNS resolution for that domain.
 
 
 Requirements

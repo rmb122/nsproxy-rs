@@ -18,13 +18,10 @@ use smoltcp::time::Instant as SmolInstant;
 use smoltcp::wire::{HardwareAddress, IpAddress, IpCidr, IpListenEndpoint};
 use tokio::io::unix::AsyncFd;
 
+use crate::config::Config as AppConfig;
 use crate::config::net::{DNS_ADDR, DNS_PORT, TUN_GW, TUN_PREFIX};
-use crate::config::{Config as AppConfig, ProxyType};
 use crate::fake_dns::{self, FakeDns};
-use crate::proxy::direct::DirectConnector;
-use crate::proxy::http::HttpConnector;
-use crate::proxy::socks5::Socks5Connector;
-use crate::proxy::{ProxyConnector, ProxyStream, ProxyTarget};
+use crate::proxy::{ProxyStream, ProxyTarget};
 use crate::tun::{TunDevice, parse_tcp_syn};
 
 // ── Constants ────────────────────────────────────────────────────────────────
@@ -301,39 +298,11 @@ pub async fn run(
                                 }
                             };
 
-                            // Decide whether this target should bypass the
-                            // proxy and connect directly from the host.
-                            let bypass = match &target {
-                                ProxyTarget::Domain { host, .. } => config.bypass_domain(host),
-                                ProxyTarget::Ip { addr, .. } => config.bypass_ip(*addr),
-                            };
+                            let proxy = config.proxy_for(&target).clone();
+                            tracing::info!("TCP: new connection to {target} via {proxy}");
 
-                            if bypass {
-                                tracing::info!("TCP: new connection to {target} (bypassed)");
-                            } else {
-                                tracing::info!("TCP: new connection to {target} (proxied)");
-                            }
-
-                            // Spawn async proxy connect.
-                            let proxy_addr = config.proxy_addr;
-                            let proxy_auth = config.proxy_auth.clone();
-                            let proxy_type = config.proxy_type.clone();
-
-                            let join_handle = tokio::spawn(async move {
-                                let conn: Box<dyn ProxyConnector> = if bypass {
-                                    Box::new(DirectConnector)
-                                } else {
-                                    match proxy_type {
-                                        ProxyType::Socks5 => {
-                                            Box::new(Socks5Connector::new(proxy_addr, proxy_auth))
-                                        }
-                                        ProxyType::Http => {
-                                            Box::new(HttpConnector::new(proxy_addr, proxy_auth))
-                                        }
-                                    }
-                                };
-                                conn.connect(&target).await
-                            });
+                            let join_handle =
+                                tokio::spawn(async move { proxy.connect(&target).await });
 
                             tcp_states.insert(handle, TcpForwardState::Connecting(join_handle));
                         }

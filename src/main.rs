@@ -1,10 +1,10 @@
-mod bypass;
 mod config;
 mod event_loop;
 mod fake_dns;
 mod fd_passing;
 mod namespace;
 mod proxy;
+mod rule;
 mod tun;
 
 use std::ffi::CString;
@@ -17,8 +17,9 @@ use nix::sys::wait::{WaitStatus, waitpid};
 use nix::unistd::{ForkResult, Pid, close, execvp, fork, read, write};
 use tracing::Level;
 
-use bypass::BypassMatcher;
-use config::{Config, ProxyType};
+use config::Config;
+use proxy::ProxyConfig;
+use rule::RuleMatcher;
 
 // ── CLI ───────────────────────────────────────────────────────────────────────
 
@@ -29,30 +30,29 @@ use config::{Config, ProxyType};
 ///   nsproxy curl http://example.com
 ///   nsproxy -x socks5://127.0.0.1:1080 curl http://example.com
 ///   nsproxy -x http://user:pass@proxy.example.com:8080 wget example.com
-///   nsproxy -b cidr:10.0.0.0/8 -b domain:example.com curl http://example.com
+///   nsproxy -r cidr:10.0.0.0/8=direct curl http://example.com
 #[derive(Parser, Debug)]
 #[command(author, version, about, long_about = None)]
 struct Cli {
-    /// Proxy URL: socks5://[user:pass@]host:port or http://[user:pass@]host:port
+    /// Default route: direct, socks5://[user:pass@]host:port, or
+    /// http://[user:pass@]host:port
     #[arg(short = 'x', long = "proxy", default_value = "socks5://127.0.0.1:1080")]
     proxy: String,
 
-    /// Bypass rule — connections matching the rule skip the proxy and go
-    /// directly. Repeatable. Format: `<kind>:<value>` where kind is one of
-    /// `ip`, `cidr`, `domain`, `domain-regex`.
+    /// Routing rule. Repeatable. Format: `<kind>:<value>=<proxy>`, where proxy
+    /// is `direct` or a supported proxy URL.
     ///
     /// Examples:
-    ///   -b ip:1.2.3.4
-    ///   -b cidr:10.0.0.0/8
-    ///   -b domain:example.com
-    ///   -b 'domain-regex:.*\.example\.com'
+    ///   -r ip:1.2.3.4=direct
+    ///   -r cidr:10.0.0.0/8=socks5://127.0.0.1:1081
+    ///   -r domain:example.com=http://127.0.0.1:8080
     #[arg(
-        short = 'b',
-        long = "bypass",
+        short = 'r',
+        long = "rule",
         value_name = "RULE",
         action = clap::ArgAction::Append
     )]
-    bypass: Vec<String>,
+    rules: Vec<String>,
 
     /// Enable log output; repeat for trace-level logs
     #[arg(short = 'v', long = "verbose", action = clap::ArgAction::Count)]
@@ -65,48 +65,6 @@ struct Cli {
     /// Command to run inside the namespace (and its arguments)
     #[arg(trailing_var_arg = true, required = true)]
     command: Vec<String>,
-}
-
-/// Parsed components of a proxy URL: `(type, address, optional credentials)`.
-type ProxyUrl = (ProxyType, std::net::SocketAddr, Option<(String, String)>);
-
-/// Parse a proxy URL like "socks5://user:pass@host:port" into Config fields.
-fn parse_proxy_url(url: &str) -> Result<ProxyUrl> {
-    // Determine scheme
-    let (proxy_type, rest) = if let Some(rest) = url.strip_prefix("socks5://") {
-        (ProxyType::Socks5, rest)
-    } else if let Some(rest) = url.strip_prefix("socks://") {
-        (ProxyType::Socks5, rest)
-    } else if let Some(rest) = url.strip_prefix("http://") {
-        (ProxyType::Http, rest)
-    } else {
-        bail!(
-            "unsupported proxy scheme in '{}'. Use socks5:// or http://",
-            url
-        );
-    };
-
-    // Split auth from host:port
-    let (auth, host_port) = if let Some(at_pos) = rest.rfind('@') {
-        let auth_str = &rest[..at_pos];
-        let hp = &rest[at_pos + 1..];
-        let mut parts = auth_str.splitn(2, ':');
-        let user = parts.next().unwrap_or("").to_string();
-        let pass = parts.next().unwrap_or("").to_string();
-        if user.is_empty() {
-            bail!("empty username in proxy URL");
-        }
-        (Some((user, pass)), hp)
-    } else {
-        (None, rest)
-    };
-
-    // Parse host:port
-    let addr: std::net::SocketAddr = host_port
-        .parse()
-        .with_context(|| format!("invalid proxy address: '{}'", host_port))?;
-
-    Ok((proxy_type, addr, auth))
 }
 
 // ── Entry point ───────────────────────────────────────────────────────────────
@@ -132,16 +90,13 @@ fn main() -> Result<()> {
     }
 
     // --- build Config --------------------------------------------------------
-    let (proxy_type, proxy_addr, proxy_auth) = parse_proxy_url(&cli.proxy)?;
-
-    let bypass = BypassMatcher::from_specs(&cli.bypass).context("parse --bypass rules")?;
+    let default_proxy = ProxyConfig::parse(&cli.proxy).context("parse --proxy")?;
+    let rules = RuleMatcher::from_specs(&cli.rules).context("parse --rule")?;
 
     let config = Config {
-        proxy_type,
-        proxy_addr,
-        proxy_auth,
+        default_proxy,
         command: cli.command.clone(),
-        bypass,
+        rules,
     };
     tracing::debug!(?config, "parsed configuration");
 
