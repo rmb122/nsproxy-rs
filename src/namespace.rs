@@ -7,7 +7,10 @@
 //!   4. `create_tun()` → RawFd that is passed to the parent via fd_passing
 
 use std::collections::HashSet;
-use std::os::unix::io::RawFd;
+use std::ffi::CString;
+use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
+use std::os::unix::ffi::OsStrExt;
+use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
@@ -34,7 +37,8 @@ const IFF_NO_PI: libc::c_int = 0x1000;
 
 const INTERNAL_BIND_TARGETS: [&str; 2] = ["/etc/resolv.conf", "/etc/nsswitch.conf"];
 
-/// A validated file bind mount. Both paths are canonical absolute paths.
+/// A validated file bind mount. Both paths are absolute and preserve their
+/// directly named file or symlink object.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BindMount {
     pub source: PathBuf,
@@ -43,9 +47,9 @@ pub struct BindMount {
 
 /// Parse and validate repeatable `src:dst` bind-mount specifications.
 ///
-/// Relative paths are resolved against `cwd`. Both sides must already exist
-/// and resolve to regular files. Duplicate and internal DNS targets are
-/// rejected before the process forks.
+/// Relative paths are made absolute against `cwd` without following the final
+/// symlink. Both sides must name regular files or symlinks (including dangling
+/// symlinks). Duplicate and internal DNS targets are rejected before fork.
 pub fn parse_bind_mounts(specs: &[String], cwd: &Path) -> Result<Vec<BindMount>> {
     if specs.is_empty() {
         return Ok(Vec::new());
@@ -54,9 +58,10 @@ pub fn parse_bind_mounts(specs: &[String], cwd: &Path) -> Result<Vec<BindMount>>
     let internal_targets = INTERNAL_BIND_TARGETS
         .iter()
         .map(Path::new)
-        .map(std::fs::canonicalize)
+        .map(std::fs::symlink_metadata)
+        .map(|metadata| metadata.map(|metadata| (metadata.dev(), metadata.ino())))
         .collect::<std::io::Result<HashSet<_>>>()
-        .context("resolve internal bind-mount targets")?;
+        .context("inspect internal bind-mount targets")?;
     let mut targets = HashSet::new();
     let mut mounts = Vec::with_capacity(specs.len());
 
@@ -68,16 +73,16 @@ pub fn parse_bind_mounts(specs: &[String], cwd: &Path) -> Result<Vec<BindMount>>
             anyhow::bail!("invalid bind mount {spec:?}: expected exactly SRC:DST");
         }
 
-        let source = canonicalize_bind_path(source, cwd, "source", spec)?;
-        let target = canonicalize_bind_path(target, cwd, "target", spec)?;
+        let (source, _) = inspect_bind_path(source, cwd, "source", spec)?;
+        let (target, target_id) = inspect_bind_path(target, cwd, "target", spec)?;
 
-        if internal_targets.contains(&target) {
+        if internal_targets.contains(&target_id) {
             anyhow::bail!(
                 "bind mount target {:?} conflicts with an internal DNS mount",
                 target
             );
         }
-        if !targets.insert(target.clone()) {
+        if !targets.insert(target_id) {
             anyhow::bail!("duplicate bind mount target {:?}", target);
         }
 
@@ -87,24 +92,31 @@ pub fn parse_bind_mounts(specs: &[String], cwd: &Path) -> Result<Vec<BindMount>>
     Ok(mounts)
 }
 
-fn canonicalize_bind_path(path: &str, cwd: &Path, side: &str, spec: &str) -> Result<PathBuf> {
+fn inspect_bind_path(
+    path: &str,
+    cwd: &Path,
+    side: &str,
+    spec: &str,
+) -> Result<(PathBuf, (u64, u64))> {
     let path = Path::new(path);
     let path = if path.is_absolute() {
         path.to_path_buf()
     } else {
         cwd.join(path)
     };
-    let path = std::fs::canonicalize(&path)
-        .with_context(|| format!("resolve bind mount {side} {:?} in {spec:?}", path))?;
-    let metadata = std::fs::metadata(&path)
+    let path = std::path::absolute(&path)
+        .with_context(|| format!("make bind mount {side} {:?} absolute", path))?;
+    let metadata = std::fs::symlink_metadata(&path)
         .with_context(|| format!("inspect bind mount {side} {:?} in {spec:?}", path))?;
-    if !metadata.is_file() {
+    let file_type = metadata.file_type();
+    if !file_type.is_file() && !file_type.is_symlink() {
         anyhow::bail!(
-            "bind mount {side} {:?} in {spec:?} is not a regular file",
+            "bind mount {side} {:?} in {spec:?} is not a regular file or symlink",
             path
         );
     }
-    Ok(path)
+    let identity = (metadata.dev(), metadata.ino());
+    Ok((path, identity))
 }
 
 // ── ifreq (simplified — only the fields we need) ─────────────────────────────
@@ -217,14 +229,7 @@ pub fn setup_mount_namespace(bind_mounts: &[BindMount]) -> Result<()> {
         .context("bind-mount nsswitch.conf")?;
 
     for bind in bind_mounts {
-        nix::mount::mount(
-            Some(bind.source.as_path()),
-            bind.target.as_path(),
-            None::<&str>,
-            nix::mount::MsFlags::MS_BIND,
-            None::<&str>,
-        )
-        .with_context(|| format!("bind-mount {:?} → {:?}", bind.source, bind.target))?;
+        bind_mount_nofollow(bind)?;
         tracing::debug!(source = ?bind.source, target = ?bind.target, "file bind-mounted");
     }
 
@@ -240,6 +245,74 @@ pub fn setup_mount_namespace(bind_mounts: &[BindMount]) -> Result<()> {
     );
 
     tracing::debug!("mount namespace set up; DNS → {}", DNS_ADDR);
+    Ok(())
+}
+
+/// Bind-mount the directly named source object over the directly named target
+/// object. The new mount API lets both pathname lookups stop at a final
+/// symlink instead of following it as the classic `mount(2)` API does.
+fn bind_mount_nofollow(bind: &BindMount) -> Result<()> {
+    const MOVE_MOUNT_F_EMPTY_PATH: libc::c_uint = 0x0000_0004;
+
+    let source = CString::new(bind.source.as_os_str().as_bytes())
+        .with_context(|| format!("bind mount source {:?} contains a NUL byte", bind.source))?;
+    let target = CString::new(bind.target.as_os_str().as_bytes())
+        .with_context(|| format!("bind mount target {:?} contains a NUL byte", bind.target))?;
+
+    let open_tree_flags =
+        libc::OPEN_TREE_CLONE | libc::OPEN_TREE_CLOEXEC | libc::AT_SYMLINK_NOFOLLOW as libc::c_uint;
+    // SAFETY: `source` is a valid NUL-terminated pathname. On success the
+    // returned fd is uniquely owned and immediately wrapped in `OwnedFd`.
+    let mount_fd = unsafe {
+        libc::syscall(
+            libc::SYS_open_tree,
+            libc::AT_FDCWD,
+            source.as_ptr(),
+            open_tree_flags,
+        )
+    };
+    if mount_fd == -1 {
+        let error = std::io::Error::last_os_error();
+        if error.raw_os_error() == Some(libc::ENOSYS) {
+            anyhow::bail!(
+                "file bind mounts require Linux 5.2 or newer: open_tree is unavailable ({error})"
+            );
+        }
+        return Err(error)
+            .with_context(|| format!("open bind-mount source object {:?}", bind.source));
+    }
+    // SAFETY: a successful `open_tree` returns a new owned file descriptor.
+    let mount_fd = unsafe { OwnedFd::from_raw_fd(mount_fd as RawFd) };
+
+    // Do not pass MOVE_MOUNT_T_SYMLINKS: the target lookup must stop at the
+    // directly named symlink object. The empty source path addresses the
+    // detached mount object through `mount_fd`.
+    // SAFETY: both path pointers are NUL-terminated and `mount_fd` is valid.
+    let moved = unsafe {
+        libc::syscall(
+            libc::SYS_move_mount,
+            mount_fd.as_raw_fd(),
+            c"".as_ptr(),
+            libc::AT_FDCWD,
+            target.as_ptr(),
+            MOVE_MOUNT_F_EMPTY_PATH,
+        )
+    };
+    if moved == -1 {
+        let error = std::io::Error::last_os_error();
+        if error.raw_os_error() == Some(libc::ENOSYS) {
+            anyhow::bail!(
+                "file bind mounts require Linux 5.2 or newer: move_mount is unavailable ({error})"
+            );
+        }
+        return Err(error).with_context(|| {
+            format!(
+                "attach bind-mount source {:?} over target {:?}",
+                bind.source, bind.target
+            )
+        });
+    }
+
     Ok(())
 }
 
@@ -502,6 +575,7 @@ pub fn create_tun() -> Result<RawFd> {
 mod bind_mount_tests {
     use super::*;
     use std::fs;
+    use std::os::unix::fs::symlink;
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -527,6 +601,12 @@ mod bind_mount_tests {
         fn file(&self, name: &str) -> PathBuf {
             let path = self.0.join(name);
             fs::write(&path, name).unwrap();
+            path
+        }
+
+        fn symlink(&self, target: &str, name: &str) -> PathBuf {
+            let path = self.0.join(name);
+            symlink(target, &path).unwrap();
             path
         }
     }
@@ -582,6 +662,49 @@ mod bind_mount_tests {
             )
             .is_err()
         );
+    }
+
+    #[test]
+    fn preserves_valid_and_dangling_symlink_objects() {
+        let temp = TempDir::new();
+        temp.file("final-source");
+        temp.symlink("final-source", "second-link");
+        let source = temp.symlink("second-link", "source-link");
+        let target = temp.symlink("missing-target", "target-link");
+
+        let mounts = parse_bind_mounts(&["source-link:target-link".to_owned()], &temp.0).unwrap();
+
+        assert_eq!(mounts[0].source, source);
+        assert_eq!(mounts[0].target, target);
+        assert_eq!(
+            fs::read_link(&mounts[0].source).unwrap(),
+            Path::new("second-link")
+        );
+        assert!(
+            fs::symlink_metadata(&mounts[0].target)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+    }
+
+    #[test]
+    fn preserves_symlink_components_in_parent_path() {
+        let temp = TempDir::new();
+        let real_parent = temp.0.join("real-parent");
+        fs::create_dir(&real_parent).unwrap();
+        fs::write(real_parent.join("source"), "source").unwrap();
+        fs::write(real_parent.join("target"), "target").unwrap();
+        temp.symlink("real-parent", "parent-link");
+
+        let mounts = parse_bind_mounts(
+            &["parent-link/source:parent-link/target".to_owned()],
+            &temp.0,
+        )
+        .unwrap();
+
+        assert_eq!(mounts[0].source, temp.0.join("parent-link/source"));
+        assert_eq!(mounts[0].target, temp.0.join("parent-link/target"));
     }
 
     #[test]

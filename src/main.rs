@@ -27,16 +27,16 @@ use rule::RuleMatcher;
 /// is transparently proxied.
 ///
 /// Examples:
-///   nsproxy curl http://example.com
+///   nsproxy -x socks5://127.0.0.1:1080 curl http://example.com
 ///   nsproxy -x socks5://127.0.0.1:1080 curl http://example.com
 ///   nsproxy -x http://user:pass@proxy.example.com:8080 wget example.com
-///   nsproxy -r cidr:10.0.0.0/8=direct curl http://example.com
+///   nsproxy -x direct -r cidr:10.0.0.0/8=direct curl http://example.com
 #[derive(Parser, Debug)]
 #[command(author, version, about, long_about = None)]
 struct Cli {
     /// Default route: direct, socks5://[user:pass@]host:port, or
     /// http://[user:pass@]host:port
-    #[arg(short = 'x', long = "proxy", default_value = "socks5://127.0.0.1:1080")]
+    #[arg(short = 'x', long = "proxy")]
     proxy: String,
 
     /// Routing rule. Repeatable. Format: `<kind>:<value>=<proxy>`, where proxy
@@ -80,12 +80,17 @@ mod cli_tests {
     #[test]
     fn bind_option_is_repeatable_before_command() {
         let cli = Cli::try_parse_from([
-            "nsproxy", "-b", "a:b", "--bind", "c:d", "command", "-b", "argument",
+            "nsproxy", "-x", "direct", "-b", "a:b", "--bind", "c:d", "command", "-b", "argument",
         ])
         .unwrap();
 
         assert_eq!(cli.binds, ["a:b", "c:d"]);
         assert_eq!(cli.command, ["command", "-b", "argument"]);
+    }
+
+    #[test]
+    fn proxy_option_is_required() {
+        assert!(Cli::try_parse_from(["nsproxy", "command"]).is_err());
     }
 }
 
