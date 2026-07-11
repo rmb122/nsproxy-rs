@@ -9,7 +9,7 @@
 use std::collections::{HashMap, HashSet};
 use std::net::Ipv4Addr;
 use std::os::unix::io::{AsRawFd, RawFd};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use smoltcp::iface::{Config, Interface, SocketHandle, SocketSet};
@@ -31,6 +31,8 @@ use crate::tun::{TunDevice, parse_tcp_syn};
 
 /// TCP socket buffer size.
 const TCP_BUF_SIZE: usize = 65536;
+/// Maximum time to retain a socket whose inbound TCP handshake has not completed.
+const TCP_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(32);
 /// UDP packet buffer metadata slots.
 const UDP_META_COUNT: usize = 16;
 /// UDP packet buffer payload size.
@@ -40,7 +42,7 @@ const UDP_BUF_SIZE: usize = 4096;
 
 enum TcpForwardState {
     /// We've created the listening socket but connection is not yet established.
-    Listening,
+    Listening { created_at: Instant },
     /// The TCP handshake completed in smoltcp; we're connecting to the proxy.
     Connecting(tokio::task::JoinHandle<Result<ProxyStream>>),
     /// Proxy connection established; shuttling data.
@@ -49,15 +51,20 @@ enum TcpForwardState {
     Closing,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ProxyReadState {
+    Open,
+    Eof,
+    Failed,
+}
+
 /// Context for an established TCP forwarding connection.
 struct TcpForwardCtx {
     stream: ProxyStream,
     /// Data read from proxy, waiting to be written to smoltcp socket.
     proxy_to_app: Vec<u8>,
-    /// True once the proxy side has EOF'd (or errored). We stop reading
-    /// from proxy, drain whatever's left in `proxy_to_app` to the client,
-    /// and only then close the smoltcp tx side to propagate the FIN.
-    proxy_closed: bool,
+    /// Whether the upstream is still readable, reached a normal EOF, or failed.
+    proxy_read_state: ProxyReadState,
 }
 
 // ── Public entry point ───────────────────────────────────────────────────────
@@ -188,7 +195,12 @@ pub async fn run(
                         };
                         if sock.listen(listen_ep).is_ok() {
                             let handle = sockets.add(sock);
-                            tcp_states.insert(handle, TcpForwardState::Listening);
+                            tcp_states.insert(
+                                handle,
+                                TcpForwardState::Listening {
+                                    created_at: Instant::now(),
+                                },
+                            );
                             listening_endpoints.insert(key);
                             handle_to_endpoint.insert(handle, key);
                         } else {
@@ -204,7 +216,7 @@ pub async fn run(
 
         // Debug: print TCP socket states
         for (handle, state) in tcp_states.iter() {
-            if matches!(state, TcpForwardState::Listening) {
+            if matches!(state, TcpForwardState::Listening { .. }) {
                 let sock = sockets.get::<tcp::Socket>(*handle);
                 let s = sock.state();
                 if s != tcp::State::Listen {
@@ -252,7 +264,7 @@ pub async fn run(
         for handle in handles {
             let state = tcp_states.get(&handle).unwrap();
             match state {
-                TcpForwardState::Listening => {
+                TcpForwardState::Listening { created_at } => {
                     let sock = sockets.get::<tcp::Socket>(handle);
                     if sock.state() == tcp::State::Established
                         || sock.state() == tcp::State::CloseWait
@@ -329,6 +341,14 @@ pub async fn run(
                         || sock.state() == tcp::State::TimeWait
                     {
                         tcp_states.insert(handle, TcpForwardState::Closing);
+                    } else if created_at.elapsed() >= TCP_HANDSHAKE_TIMEOUT {
+                        tracing::debug!(
+                            "TCP handshake timed out for socket {handle} in state {:?}",
+                            sock.state()
+                        );
+                        let sock = sockets.get_mut::<tcp::Socket>(handle);
+                        sock.abort();
+                        tcp_states.insert(handle, TcpForwardState::Closing);
                     }
                 }
                 TcpForwardState::Connecting(_jh) => {
@@ -368,7 +388,7 @@ pub async fn run(
                                 TcpForwardState::Established(TcpForwardCtx {
                                     stream,
                                     proxy_to_app: Vec::new(),
-                                    proxy_closed: false,
+                                    proxy_read_state: ProxyReadState::Open,
                                 }),
                             );
                         }
@@ -471,17 +491,17 @@ pub async fn run(
 
                 // --- Proxy → App direction ---
                 // 1. Read from proxy into proxy_to_app buffer (if buffer has space
-                //    AND we haven't already seen EOF). On EOF/error we only mark
-                //    proxy_closed; the smoltcp socket is closed below once the
-                //    buffer has been fully drained to the client, so no data is
-                //    lost to a premature FIN.
-                if !ctx.proxy_closed && ctx.proxy_to_app.len() < TCP_BUF_SIZE {
+                //    AND we haven't already seen EOF/error). A normal EOF waits
+                //    for queued response data below; an error resets immediately.
+                if ctx.proxy_read_state == ProxyReadState::Open
+                    && ctx.proxy_to_app.len() < TCP_BUF_SIZE
+                {
                     let space = TCP_BUF_SIZE - ctx.proxy_to_app.len();
                     match ctx.stream.inner.try_read(&mut tmp_buf[..space]) {
                         Ok(0) => {
                             // Proxy EOF — defer close until the buffer is drained.
                             tracing::debug!("proxy stream closed for socket {handle}");
-                            ctx.proxy_closed = true;
+                            ctx.proxy_read_state = ProxyReadState::Eof;
                         }
                         Ok(n) => {
                             ctx.proxy_to_app.extend_from_slice(&tmp_buf[..n]);
@@ -489,7 +509,8 @@ pub async fn run(
                         Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
                         Err(e) => {
                             tracing::debug!("proxy read error: {e}");
-                            ctx.proxy_closed = true;
+                            ctx.proxy_read_state = ProxyReadState::Failed;
+                            sock.abort();
                         }
                     }
                 }
@@ -511,13 +532,18 @@ pub async fn run(
                     }
                 }
 
-                // 3. If proxy is gone and we've flushed everything we buffered,
-                // close whe whole connection, since we don't know how proxy connection is half closing or full closing
-                if ctx.proxy_closed && ctx.proxy_to_app.is_empty() && sock.may_send() {
+                // 3. After a normal upstream EOF, abort only once all response
+                // bytes have been acknowledged by the client.
+                let drained_after_eof = ctx.proxy_read_state == ProxyReadState::Eof
+                    && ctx.proxy_to_app.is_empty()
+                    && sock.send_queue() == 0
+                    && sock.may_send();
+                if drained_after_eof {
                     sock.abort();
                 }
 
-                // Check if smoltcp socket closed.
+                // Client half-close remains intentionally unsupported: either
+                // closed half aborts the whole connection.
                 if !sock.may_recv() || !sock.may_send() {
                     sock.abort();
                     tcp_states.insert(handle, TcpForwardState::Closing);
