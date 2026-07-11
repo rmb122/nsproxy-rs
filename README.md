@@ -57,6 +57,7 @@ Usage
     Options:
       -x, --proxy <PROXY>  Default route (default: socks5://127.0.0.1:1080)
       -r, --rule <RULE>    Routing rule (repeatable); see "Routing rules" below
+      -b, --bind <SRC:DST> Bind-mount a file in the namespace (repeatable)
       -v, --verbose        Enable log output; repeat for trace-level logs
       -q, --quiet          Suppress all log output
       -h, --help           Print help
@@ -71,6 +72,7 @@ Usage
       nsproxy -x socks5://127.0.0.1:1080 curl http://example.com
       nsproxy -x http://user:pass@proxy:8080 wget http://example.com
       nsproxy -x direct -r domain:example.com=socks5://127.0.0.1:1080 curl http://example.com
+      nsproxy -b ./custom.conf:/etc/example.conf cat /etc/example.conf
       nsproxy ssh user@remote-host
       nsproxy -r cidr:10.0.0.0/8=direct curl http://internal
 
@@ -105,6 +107,26 @@ Notes:
   intercepted DNS query. Matching is case-insensitive for `domain`.
 - A `direct` domain route uses the host's resolver, so it opts in to host-side
   DNS resolution for that domain.
+
+
+File bind mounts
+----------------
+
+Use repeatable `--bind` (`-b`) options before the command to expose custom
+files inside the command's mount namespace:
+
+      nsproxy -b ./config.toml:/etc/myapp/config.toml myapp
+
+For example, run `date` with the US Eastern time zone by mounting its zoneinfo
+file over the existing `/etc/localtime`:
+
+      nsproxy -b /usr/share/zoneinfo/America/New_York:/etc/localtime date
+
+Both paths may be relative to the directory where nsproxy is started. The
+source and target must already exist and must both be regular files. Bind
+mounts are read-write; directories and Docker-style mode suffixes such as
+`:ro` are not supported. Duplicate targets and the internal DNS mount targets
+`/etc/resolv.conf` and `/etc/nsswitch.conf` are rejected.
 
 
 Requirements

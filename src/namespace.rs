@@ -6,7 +6,9 @@
 //!   3. `setup_mount_namespace()`
 //!   4. `create_tun()` → RawFd that is passed to the parent via fd_passing
 
+use std::collections::HashSet;
 use std::os::unix::io::RawFd;
+use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 use nix::sched::{CloneFlags, unshare};
@@ -29,6 +31,81 @@ const TUNSETIFF: libc::c_ulong = if cfg!(any(
 
 const IFF_TUN: libc::c_int = 0x0001;
 const IFF_NO_PI: libc::c_int = 0x1000;
+
+const INTERNAL_BIND_TARGETS: [&str; 2] = ["/etc/resolv.conf", "/etc/nsswitch.conf"];
+
+/// A validated file bind mount. Both paths are canonical absolute paths.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BindMount {
+    pub source: PathBuf,
+    pub target: PathBuf,
+}
+
+/// Parse and validate repeatable `src:dst` bind-mount specifications.
+///
+/// Relative paths are resolved against `cwd`. Both sides must already exist
+/// and resolve to regular files. Duplicate and internal DNS targets are
+/// rejected before the process forks.
+pub fn parse_bind_mounts(specs: &[String], cwd: &Path) -> Result<Vec<BindMount>> {
+    if specs.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let internal_targets = INTERNAL_BIND_TARGETS
+        .iter()
+        .map(Path::new)
+        .map(std::fs::canonicalize)
+        .collect::<std::io::Result<HashSet<_>>>()
+        .context("resolve internal bind-mount targets")?;
+    let mut targets = HashSet::new();
+    let mut mounts = Vec::with_capacity(specs.len());
+
+    for spec in specs {
+        let mut fields = spec.split(':');
+        let source = fields.next().unwrap_or_default();
+        let target = fields.next().unwrap_or_default();
+        if source.is_empty() || target.is_empty() || fields.next().is_some() {
+            anyhow::bail!("invalid bind mount {spec:?}: expected exactly SRC:DST");
+        }
+
+        let source = canonicalize_bind_path(source, cwd, "source", spec)?;
+        let target = canonicalize_bind_path(target, cwd, "target", spec)?;
+
+        if internal_targets.contains(&target) {
+            anyhow::bail!(
+                "bind mount target {:?} conflicts with an internal DNS mount",
+                target
+            );
+        }
+        if !targets.insert(target.clone()) {
+            anyhow::bail!("duplicate bind mount target {:?}", target);
+        }
+
+        mounts.push(BindMount { source, target });
+    }
+
+    Ok(mounts)
+}
+
+fn canonicalize_bind_path(path: &str, cwd: &Path, side: &str, spec: &str) -> Result<PathBuf> {
+    let path = Path::new(path);
+    let path = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        cwd.join(path)
+    };
+    let path = std::fs::canonicalize(&path)
+        .with_context(|| format!("resolve bind mount {side} {:?} in {spec:?}", path))?;
+    let metadata = std::fs::metadata(&path)
+        .with_context(|| format!("inspect bind mount {side} {:?} in {spec:?}", path))?;
+    if !metadata.is_file() {
+        anyhow::bail!(
+            "bind mount {side} {:?} in {spec:?} is not a regular file",
+            path
+        );
+    }
+    Ok(path)
+}
 
 // ── ifreq (simplified — only the fields we need) ─────────────────────────────
 
@@ -118,7 +195,7 @@ pub fn write_id_maps(child_pid: u32, uid: u32, gid: u32) -> Result<()> {
 
 /// Create a private mount namespace and bind-mount custom `resolv.conf` and
 /// `nsswitch.conf` to force DNS through our fake resolver.
-pub fn setup_mount_namespace() -> Result<()> {
+pub fn setup_mount_namespace(bind_mounts: &[BindMount]) -> Result<()> {
     unshare(CloneFlags::CLONE_NEWNS).context("unshare(CLONE_NEWNS)")?;
 
     // Make the mount namespace fully private (no propagation to/from host)
@@ -138,6 +215,18 @@ pub fn setup_mount_namespace() -> Result<()> {
 
     bind_mount_tmpfile("hosts: files dns\n", "/etc/nsswitch.conf")
         .context("bind-mount nsswitch.conf")?;
+
+    for bind in bind_mounts {
+        nix::mount::mount(
+            Some(bind.source.as_path()),
+            bind.target.as_path(),
+            None::<&str>,
+            nix::mount::MsFlags::MS_BIND,
+            None::<&str>,
+        )
+        .with_context(|| format!("bind-mount {:?} → {:?}", bind.source, bind.target))?;
+        tracing::debug!(source = ?bind.source, target = ?bind.target, "file bind-mounted");
+    }
 
     // WORKAROUND: ssh complains about "Bad owner or permissions" on config files
     // because inside the user namespace, file owners map to nobody (65534).
@@ -407,4 +496,108 @@ pub fn create_tun() -> Result<RawFd> {
         TUN_GW
     );
     Ok(fd)
+}
+
+#[cfg(test)]
+mod bind_mount_tests {
+    use super::*;
+    use std::fs;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    static NEXT_TEMP_DIR: AtomicU64 = AtomicU64::new(0);
+
+    struct TempDir(PathBuf);
+
+    impl TempDir {
+        fn new() -> Self {
+            let id = NEXT_TEMP_DIR.fetch_add(1, Ordering::Relaxed);
+            let nanos = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos();
+            let path = std::env::temp_dir().join(format!(
+                "nsproxy-bind-test-{}-{nanos}-{id}",
+                std::process::id()
+            ));
+            fs::create_dir(&path).unwrap();
+            Self(path)
+        }
+
+        fn file(&self, name: &str) -> PathBuf {
+            let path = self.0.join(name);
+            fs::write(&path, name).unwrap();
+            path
+        }
+    }
+
+    impl Drop for TempDir {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+
+    #[test]
+    fn parses_absolute_and_relative_file_paths() {
+        let temp = TempDir::new();
+        let source = temp.file("source");
+        let target = temp.file("target");
+        let absolute = format!("{}:{}", source.display(), target.display());
+
+        let absolute_mounts = parse_bind_mounts(&[absolute], &temp.0).unwrap();
+        let relative_mounts = parse_bind_mounts(&["source:target".to_owned()], &temp.0).unwrap();
+
+        assert_eq!(absolute_mounts, relative_mounts);
+        assert!(absolute_mounts[0].source.is_absolute());
+        assert!(absolute_mounts[0].target.is_absolute());
+    }
+
+    #[test]
+    fn rejects_invalid_bind_syntax() {
+        let cwd = std::env::current_dir().unwrap();
+        for spec in ["source", ":target", "source:", "a:b:c"] {
+            assert!(parse_bind_mounts(&[spec.to_owned()], &cwd).is_err());
+        }
+    }
+
+    #[test]
+    fn rejects_missing_paths_and_directories() {
+        let temp = TempDir::new();
+        let source = temp.file("source");
+        let target = temp.file("target");
+
+        assert!(parse_bind_mounts(&["missing:target".to_owned()], &temp.0).is_err());
+        assert!(parse_bind_mounts(&["source:missing".to_owned()], &temp.0).is_err());
+        assert!(
+            parse_bind_mounts(
+                &[format!("{}:{}", temp.0.display(), target.display())],
+                &temp.0
+            )
+            .is_err()
+        );
+        assert!(
+            parse_bind_mounts(
+                &[format!("{}:{}", source.display(), temp.0.display())],
+                &temp.0
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn rejects_duplicate_and_internal_targets() {
+        let temp = TempDir::new();
+        temp.file("source-one");
+        temp.file("source-two");
+        temp.file("target");
+        let duplicates = vec![
+            "source-one:target".to_owned(),
+            "source-two:./target".to_owned(),
+        ];
+
+        assert!(parse_bind_mounts(&duplicates, &temp.0).is_err());
+
+        let internal = "source-one:/etc/resolv.conf".to_owned();
+        assert!(parse_bind_mounts(&[internal], &temp.0).is_err());
+    }
 }

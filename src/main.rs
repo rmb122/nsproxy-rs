@@ -54,6 +54,16 @@ struct Cli {
     )]
     rules: Vec<String>,
 
+    /// Bind-mount a file inside the mount namespace. Repeatable. Format:
+    /// `<src>:<dst>`; relative paths are resolved from the current directory.
+    #[arg(
+        short = 'b',
+        long = "bind",
+        value_name = "SRC:DST",
+        action = clap::ArgAction::Append
+    )]
+    binds: Vec<String>,
+
     /// Enable log output; repeat for trace-level logs
     #[arg(short = 'v', long = "verbose", action = clap::ArgAction::Count)]
     verbose: u8,
@@ -65,6 +75,22 @@ struct Cli {
     /// Command to run inside the namespace (and its arguments)
     #[arg(trailing_var_arg = true, required = true)]
     command: Vec<String>,
+}
+
+#[cfg(test)]
+mod cli_tests {
+    use super::*;
+
+    #[test]
+    fn bind_option_is_repeatable_before_command() {
+        let cli = Cli::try_parse_from([
+            "nsproxy", "-b", "a:b", "--bind", "c:d", "command", "-b", "argument",
+        ])
+        .unwrap();
+
+        assert_eq!(cli.binds, ["a:b", "c:d"]);
+        assert_eq!(cli.command, ["command", "-b", "argument"]);
+    }
 }
 
 // ── Entry point ───────────────────────────────────────────────────────────────
@@ -92,9 +118,12 @@ fn main() -> Result<()> {
     // --- build Config --------------------------------------------------------
     let default_proxy = ProxyConfig::parse(&cli.proxy).context("parse --proxy")?;
     let rules = RuleMatcher::from_specs(&cli.rules).context("parse --rule")?;
+    let cwd = std::env::current_dir().context("get current directory")?;
+    let bind_mounts = namespace::parse_bind_mounts(&cli.binds, &cwd).context("parse --bind")?;
 
     let config = Config {
         default_proxy,
+        bind_mounts,
         command: cli.command.clone(),
         rules,
     };
@@ -175,8 +204,8 @@ fn child_main(sock: RawFd, config: &Config) -> Result<i32> {
     // 5. Create tun0 and configure it.
     let tun_fd: RawFd = namespace::create_tun().context("create_tun")?;
 
-    // 6. Set up mount namespace with custom resolv.conf.
-    namespace::setup_mount_namespace().context("setup_mount_namespace")?;
+    // 6. Set up mount namespace with custom resolv.conf and user bind mounts.
+    namespace::setup_mount_namespace(&config.bind_mounts).context("setup_mount_namespace")?;
 
     // 7. Send the TUN fd to the parent.
     tracing::debug!("child: sending TUN fd to parent");
