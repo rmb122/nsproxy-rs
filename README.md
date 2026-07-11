@@ -59,7 +59,6 @@ Usage
       -r, --rule <RULE>    Routing rule (repeatable); see "Routing rules" below
       -b, --bind <SRC:DST> Bind-mount a file in the namespace (repeatable)
       -v, --verbose        Enable log output; repeat for trace-level logs
-      -q, --quiet          Suppress all log output
       -h, --help           Print help
 
     Proxy format:

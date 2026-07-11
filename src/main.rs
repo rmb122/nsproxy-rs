@@ -68,10 +68,6 @@ struct Cli {
     #[arg(short = 'v', long = "verbose", action = clap::ArgAction::Count)]
     verbose: u8,
 
-    /// Suppress all log output
-    #[arg(short = 'q', long = "quiet")]
-    quiet: bool,
-
     /// Command to run inside the namespace (and its arguments)
     #[arg(trailing_var_arg = true, required = true)]
     command: Vec<String>,
@@ -99,7 +95,7 @@ fn main() -> Result<()> {
     let cli = Cli::parse();
 
     // --- tracing init --------------------------------------------------------
-    let log_level = if cli.quiet || cli.verbose == 0 {
+    let log_level = if cli.verbose == 0 {
         None
     } else {
         Some(match cli.verbose {
