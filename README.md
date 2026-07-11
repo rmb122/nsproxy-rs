@@ -57,7 +57,7 @@ Usage
     Options:
       -x, --proxy <URL>    Proxy URL (default: socks5://127.0.0.1:1080)
       -b, --bypass <RULE>  Bypass rule (repeatable); see "Bypass rules" below
-      -v, --verbose        Increase verbosity (repeatable)
+      -v, --verbose        Enable log output; repeat for trace-level logs
       -q, --quiet          Suppress all log output
       -h, --help           Print help
 
@@ -69,7 +69,7 @@ Usage
       nsproxy curl http://example.com
       nsproxy -x socks5://127.0.0.1:1080 curl http://example.com
       nsproxy -x http://user:pass@proxy:8080 wget http://example.com
-      nsproxy -q ssh user@remote-host
+      nsproxy ssh user@remote-host
       nsproxy -b cidr:10.0.0.0/8 -b domain:example.com curl http://internal
 
 

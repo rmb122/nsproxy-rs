@@ -54,7 +54,7 @@ struct Cli {
     )]
     bypass: Vec<String>,
 
-    /// Increase verbosity (may be repeated)
+    /// Enable log output; repeat for trace-level logs
     #[arg(short = 'v', long = "verbose", action = clap::ArgAction::Count)]
     verbose: u8,
 
@@ -115,11 +115,10 @@ fn main() -> Result<()> {
     let cli = Cli::parse();
 
     // --- tracing init --------------------------------------------------------
-    let log_level = if cli.quiet {
+    let log_level = if cli.quiet || cli.verbose == 0 {
         None
     } else {
         Some(match cli.verbose {
-            0 => Level::INFO,
             1 => Level::DEBUG,
             _ => Level::TRACE,
         })
@@ -131,9 +130,6 @@ fn main() -> Result<()> {
             .with_target(false)
             .init();
     }
-
-    // Enable smoltcp's internal logging (uses `log` crate)
-    let _ = env_logger::try_init();
 
     // --- build Config --------------------------------------------------------
     let (proxy_type, proxy_addr, proxy_auth) = parse_proxy_url(&cli.proxy)?;
