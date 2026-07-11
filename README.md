@@ -116,10 +116,11 @@ files inside the command's mount namespace:
 
       nsproxy -x direct -b ./config.toml:/etc/myapp/config.toml myapp
 
-For example, run `date` with the US Eastern time zone by mounting its zoneinfo
-file over the existing `/etc/localtime`:
+For example, create a symbolic link for the US Eastern time zone and mount the
+link over the existing `/etc/localtime` when running `date`:
 
-      nsproxy -x direct -b /usr/share/zoneinfo/America/New_York:/etc/localtime date
+      ln -s /usr/share/zoneinfo/America/New_York ./new-york-localtime
+      nsproxy -x direct -b ./new-york-localtime:/etc/localtime date
 
 Both paths may be relative to the directory where nsproxy is started. Each
 path must name either a regular file or a symbolic link; dangling symbolic
