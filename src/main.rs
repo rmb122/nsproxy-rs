@@ -4,6 +4,7 @@ mod fake_dns;
 mod fd_passing;
 mod namespace;
 mod proxy;
+mod publish;
 mod rule;
 mod tun;
 
@@ -64,6 +65,16 @@ struct Cli {
     )]
     binds: Vec<String>,
 
+    /// Publish a host TCP port to the TUN address inside the namespace.
+    /// Repeatable. Format: `[HOST_IP:]HOST_PORT:NS_PORT[/tcp]`.
+    #[arg(
+        short = 'p',
+        long = "publish",
+        value_name = "[HOST_IP:]HOST_PORT:NS_PORT[/tcp]",
+        action = clap::ArgAction::Append
+    )]
+    publishes: Vec<String>,
+
     /// Enable log output; repeat for trace-level logs
     #[arg(short = 'v', long = "verbose", action = clap::ArgAction::Count)]
     verbose: u8,
@@ -89,8 +100,45 @@ mod cli_tests {
     }
 
     #[test]
+    fn publish_option_is_repeatable_before_command() {
+        let cli = Cli::try_parse_from([
+            "nsproxy",
+            "-x",
+            "direct",
+            "-p",
+            "8080:80",
+            "--publish",
+            "127.0.0.1:8443:443/tcp",
+            "command",
+            "-p",
+            "argument",
+        ])
+        .unwrap();
+
+        assert_eq!(cli.publishes, ["8080:80", "127.0.0.1:8443:443/tcp"]);
+        assert_eq!(cli.command, ["command", "-p", "argument"]);
+    }
+
+    #[test]
     fn proxy_option_is_required() {
         assert!(Cli::try_parse_from(["nsproxy", "command"]).is_err());
+    }
+
+    #[test]
+    fn control_channel_eof_is_not_a_signal() {
+        use std::os::fd::AsRawFd;
+
+        let (reader, writer) = socketpair(
+            AddressFamily::Unix,
+            SockType::Stream,
+            None,
+            SockFlag::SOCK_CLOEXEC,
+        )
+        .unwrap();
+        drop(writer);
+
+        let error = read_control_byte(reader.as_raw_fd(), "ready signal").unwrap_err();
+        assert!(error.to_string().contains("closed before ready signal"));
     }
 }
 
@@ -121,10 +169,12 @@ fn main() -> Result<()> {
     let rules = RuleMatcher::from_specs(&cli.rules).context("parse --rule")?;
     let cwd = std::env::current_dir().context("get current directory")?;
     let bind_mounts = namespace::parse_bind_mounts(&cli.binds, &cwd).context("parse --bind")?;
+    let publishes = publish::parse_publish_specs(&cli.publishes).context("parse --publish")?;
 
     let config = Config {
         default_proxy,
         bind_mounts,
+        publishes,
         command: cli.command.clone(),
         rules,
     };
@@ -180,6 +230,22 @@ fn main() -> Result<()> {
 
 // ── Child logic ───────────────────────────────────────────────────────────────
 
+/// Read exactly one byte from the fork setup channel. A clean EOF is an error:
+/// it means the peer exited during setup and must never be mistaken for a
+/// successful acknowledgement.
+fn read_control_byte(sock: RawFd, label: &str) -> Result<u8> {
+    let mut byte = [0u8; 1];
+    loop {
+        match read(sock, &mut byte) {
+            Ok(1) => return Ok(byte[0]),
+            Ok(0) => bail!("setup channel closed before {label}"),
+            Ok(_) => unreachable!("one-byte read returned more than one byte"),
+            Err(nix::errno::Errno::EINTR) => continue,
+            Err(error) => return Err(error).with_context(|| format!("read {label}")),
+        }
+    }
+}
+
 fn child_main(sock: RawFd, config: &Config) -> Result<i32> {
     tracing::debug!("child: setting up namespace");
 
@@ -194,8 +260,10 @@ fn child_main(sock: RawFd, config: &Config) -> Result<i32> {
     // 3. Wait for parent to write uid/gid maps (if needed).
     if needs_maps {
         tracing::debug!("child: waiting for parent to write id maps");
-        let mut ack = [0u8; 1];
-        read(sock, &mut ack).context("read maps-done ack")?;
+        let ack = read_control_byte(sock, "maps-done acknowledgement")?;
+        if ack != 1 {
+            bail!("invalid maps-done acknowledgement byte {ack}");
+        }
         tracing::debug!("child: id maps written by parent");
     }
 
@@ -214,8 +282,10 @@ fn child_main(sock: RawFd, config: &Config) -> Result<i32> {
 
     // 8. Wait for the parent's ready signal (1 byte).
     tracing::debug!("child: waiting for ready signal from parent");
-    let mut ready = [0u8; 1];
-    read(sock, &mut ready).context("read ready signal")?;
+    let ready = read_control_byte(sock, "ready signal")?;
+    if ready != 1 {
+        bail!("invalid ready signal byte {ready}");
+    }
     tracing::debug!("child: received ready signal, launching command");
 
     // 9. Close setup-only fds before launching the user's command.
@@ -323,9 +393,12 @@ fn wait_for_command_tree(command_pid: Pid) -> Result<i32> {
 
 fn parent_main(sock: RawFd, child: nix::unistd::Pid, config: Config) -> Result<()> {
     // 1. Wait for child to signal that it has unshared.
-    let mut unshare_signal = [0u8; 1];
-    read(sock, &mut unshare_signal).context("read unshare signal from child")?;
-    let needs_maps = unshare_signal[0] == 1;
+    let unshare_signal = read_control_byte(sock, "unshare signal from child")?;
+    let needs_maps = match unshare_signal {
+        0 => false,
+        1 => true,
+        other => bail!("invalid unshare signal byte {other}"),
+    };
     tracing::debug!("parent: child unshared, needs_maps={needs_maps}");
 
     // 2. If child created a user namespace, write its uid/gid maps from here.
@@ -345,23 +418,47 @@ fn parent_main(sock: RawFd, child: nix::unistd::Pid, config: Config) -> Result<(
     let tun_fd: RawFd = fd_passing::recv_fd(sock).context("recv_fd")?;
     tracing::info!("parent: received TUN fd = {tun_fd}");
 
-    // 4. Signal child that we are ready (send byte 0x01).
-    let sock_bfd = unsafe { BorrowedFd::borrow_raw(sock) };
-    write(sock_bfd, &[1u8]).context("write ready signal")?;
-    tracing::debug!("parent: sent ready signal to child");
+    // 4. Bind every published host port before allowing the user's command to
+    // start. This makes address conflicts a startup error rather than a
+    // background event-loop failure.
+    let bound_publishes =
+        publish::bind_publish_specs(&config.publishes).context("bind --publish")?;
+    for published in &bound_publishes {
+        tracing::info!(
+            "TCP publish: {} -> {}:{}",
+            published.spec.host_addr(),
+            config::net::TUN_ADDR,
+            published.spec.namespace_port
+        );
+    }
 
-    // 3. Build tokio runtime and run the event loop.
+    // 5. Build the runtime before releasing the child as well, so every
+    // startup operation that can fail has completed first.
     let rt = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
         .context("build tokio runtime")?;
+    let registered_publishes = {
+        let _runtime_guard = rt.enter();
+        publish::register_publish_specs(bound_publishes).context("register --publish")?
+    };
+
+    // 6. Signal child that we are ready (send byte 0x01).
+    let sock_bfd = unsafe { BorrowedFd::borrow_raw(sock) };
+    write(sock_bfd, &[1u8]).context("write ready signal")?;
+    tracing::debug!("parent: sent ready signal to child");
 
     let exit_code = rt.block_on(async move {
         // Shutdown channel: event loop stops when we signal true.
         let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
 
         // Spawn the event loop.
-        let event_loop_handle = tokio::spawn(event_loop::run(tun_fd, config, shutdown_rx));
+        let event_loop_handle = tokio::spawn(event_loop::run(
+            tun_fd,
+            config,
+            registered_publishes,
+            shutdown_rx,
+        ));
 
         // Wait for child to exit (in a blocking fashion on a separate thread).
         let child_pid = child;

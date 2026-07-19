@@ -2,6 +2,7 @@ use std::net::IpAddr;
 
 use crate::namespace::BindMount;
 use crate::proxy::{ProxyConfig, ProxyTarget};
+use crate::publish::PublishSpec;
 use crate::rule::RuleMatcher;
 
 #[derive(Debug, Clone)]
@@ -9,6 +10,7 @@ pub struct Config {
     /// Route used when no rule matches the destination.
     pub default_proxy: ProxyConfig,
     pub bind_mounts: Vec<BindMount>,
+    pub publishes: Vec<PublishSpec>,
     pub command: Vec<String>,
     pub rules: RuleMatcher,
 }
@@ -74,6 +76,7 @@ mod tests {
         let config = Config {
             default_proxy: ProxyConfig::Direct,
             bind_mounts: Vec::new(),
+            publishes: Vec::new(),
             command: Vec::new(),
             rules: RuleMatcher::from_specs(&["ip:1.1.1.1=socks5://127.0.0.1:1081"]).unwrap(),
         };

@@ -28,6 +28,8 @@ How it works
    using the domain name (ATYP=DOMAIN for SOCKS5, Host header for HTTP).
 6. Data is shuttled bidirectionally between the smoltcp TCP socket and the
    upstream proxy connection.
+7. Published host TCP ports are accepted by the parent and connected directly
+   to the namespace-side TUN address through smoltcp.
 
 
 Features
@@ -38,6 +40,7 @@ Features
 - Transparent to the application -- works with statically linked binaries.
 - No root privilege required (uses unprivileged user namespaces).
 - No DNS leaks -- domain names are resolved by the proxy server.
+- Supports publishing host TCP ports to services inside the namespace.
 - Does not affect other processes on the system.
 
 
@@ -58,6 +61,7 @@ Usage
       -x, --proxy <PROXY>  Default route
       -r, --rule <RULE>    Routing rule (repeatable); see "Routing rules" below
       -b, --bind <SRC:DST> Bind-mount a file in the namespace (repeatable)
+      -p, --publish <SPEC> Publish a host TCP port to the namespace (repeatable)
       -v, --verbose        Enable log output; repeat for trace-level logs
       -h, --help           Print help
 
@@ -72,6 +76,8 @@ Usage
       nsproxy -x http://user:pass@proxy:8080 wget http://example.com
       nsproxy -x direct -r domain:example.com=socks5://127.0.0.1:1080 curl http://example.com
       nsproxy -x direct -b ./custom.conf:/etc/example.conf cat /etc/example.conf
+      nsproxy -x direct -p 8080:80 web-server --listen 0.0.0.0:80
+      nsproxy -x direct -p 127.0.0.1:8443:443/tcp web-server --listen 0.0.0.0:443
       nsproxy -x socks5://127.0.0.1:1080 ssh user@remote-host
       nsproxy -x socks5://127.0.0.1:1080 -r cidr:10.0.0.0/8=direct curl http://internal
 
@@ -132,6 +138,29 @@ supported. Duplicate targets and the internal DNS mount targets
 `/etc/resolv.conf` and `/etc/nsswitch.conf` are rejected.
 
 
+TCP port publishing
+-------------------
+
+Use repeatable `--publish` (`-p`) options before the command to expose TCP
+services running inside the network namespace:
+
+      [HOST_IP:]HOST_PORT:NS_PORT[/tcp]
+
+For example:
+
+      nsproxy -x direct -p 127.0.0.1:8080:80/tcp server --listen 0.0.0.0:80
+
+`HOST_IP` defaults to `0.0.0.0`, which exposes the port on every host IPv4
+interface. The `/tcp` suffix is optional. UDP, IPv6 addresses, random host
+ports, and port ranges are not supported.
+
+The namespace service must listen on `172.23.255.255` (the TUN address) or
+`0.0.0.0`; a service bound only to namespace loopback (`127.0.0.1`) cannot be
+reached. Published connections bypass proxy and routing rules. The service sees
+the source as the TUN gateway `172.23.255.254`, not as the external client's
+original address.
+
+
 Requirements
 ------------
 
@@ -148,7 +177,8 @@ Limitations
 
 - TCP only (UDP forwarding is not implemented).
 - IPv4 only.
-- Programs that listen on ports (servers) will not be reachable from outside.
+- Listening programs are reachable from outside only through explicitly
+  published TCP ports.
 - Connections to loopback addresses refer to the namespace, not the host.
 - `sudo` and `su` will not work inside the namespace (only one UID is mapped).
 

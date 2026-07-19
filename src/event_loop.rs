@@ -7,7 +7,7 @@
 //! - Cleanup of closed connections
 
 use std::collections::{HashMap, HashSet};
-use std::net::Ipv4Addr;
+use std::net::{Ipv4Addr, SocketAddr};
 use std::os::unix::io::{AsRawFd, RawFd};
 use std::time::{Duration, Instant};
 
@@ -17,11 +17,14 @@ use smoltcp::socket::{tcp, udp};
 use smoltcp::time::Instant as SmolInstant;
 use smoltcp::wire::{HardwareAddress, IpAddress, IpCidr, IpListenEndpoint};
 use tokio::io::unix::AsyncFd;
+use tokio::net::TcpStream;
+use tokio::sync::mpsc;
 
 use crate::config::Config as AppConfig;
-use crate::config::net::{DNS_ADDR, DNS_PORT, TUN_GW, TUN_PREFIX};
+use crate::config::net::{DNS_ADDR, DNS_PORT, TUN_ADDR, TUN_GW, TUN_PREFIX};
 use crate::fake_dns::{self, FakeDns};
 use crate::proxy::{ProxyStream, ProxyTarget};
+use crate::publish::{PublishSpec, RegisteredPublish};
 use crate::tun::{TunDevice, parse_tcp_syn};
 
 // ── Constants ────────────────────────────────────────────────────────────────
@@ -34,6 +37,11 @@ const TCP_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(32);
 const UDP_META_COUNT: usize = 16;
 /// UDP packet buffer payload size.
 const UDP_BUF_SIZE: usize = 4096;
+/// Dynamic source ports used for host-to-namespace published connections.
+const PUBLISH_PORT_MIN: u16 = 49152;
+const PUBLISH_PORT_MAX: u16 = 65535;
+/// Accepted host sockets waiting to be attached to smoltcp.
+const PUBLISH_ACCEPT_QUEUE: usize = 128;
 
 // ── TCP forward state ────────────────────────────────────────────────────────
 
@@ -64,6 +72,71 @@ struct TcpForwardCtx {
     proxy_read_state: ProxyReadState,
 }
 
+// ── Published TCP state ──────────────────────────────────────────────────────
+
+struct AcceptedPublishedTcp {
+    stream: TcpStream,
+    peer_addr: SocketAddr,
+    spec: PublishSpec,
+}
+
+enum PublishedTcpState {
+    /// SYN has been sent through the TUN and the namespace handshake is pending.
+    Connecting {
+        stream: TcpStream,
+        peer_addr: SocketAddr,
+        created_at: Instant,
+    },
+    /// Namespace connection established; shuttle data in both directions.
+    Established(PublishedTcpCtx),
+    /// RST/FIN has been driven through smoltcp and the socket can be removed.
+    Closing,
+}
+
+struct PublishedTcpCtx {
+    stream: TcpStream,
+    peer_addr: SocketAddr,
+    /// Bytes already read from the host peer but not yet queued in smoltcp.
+    host_to_namespace: Vec<u8>,
+    /// An EOF was observed on either side; stop host reads and close the whole
+    /// connection once the forwarding queues have drained.
+    close_after_drain: bool,
+}
+
+struct PublishedPortAllocator {
+    next: u16,
+    used: HashSet<u16>,
+}
+
+impl PublishedPortAllocator {
+    fn new() -> Self {
+        Self {
+            next: PUBLISH_PORT_MIN,
+            used: HashSet::new(),
+        }
+    }
+
+    fn allocate(&mut self) -> Option<u16> {
+        let capacity = usize::from(PUBLISH_PORT_MAX - PUBLISH_PORT_MIN) + 1;
+        for _ in 0..capacity {
+            let candidate = self.next;
+            self.next = if candidate == PUBLISH_PORT_MAX {
+                PUBLISH_PORT_MIN
+            } else {
+                candidate + 1
+            };
+            if self.used.insert(candidate) {
+                return Some(candidate);
+            }
+        }
+        None
+    }
+
+    fn release(&mut self, port: u16) {
+        self.used.remove(&port);
+    }
+}
+
 // ── Public entry point ───────────────────────────────────────────────────────
 
 /// Run the main event loop.  This takes ownership of the TUN fd and runs until
@@ -71,6 +144,7 @@ struct TcpForwardCtx {
 pub async fn run(
     tun_fd: RawFd,
     config: AppConfig,
+    registered_publishes: Vec<RegisteredPublish>,
     mut shutdown: tokio::sync::watch::Receiver<bool>,
 ) -> Result<()> {
     // --- Create the smoltcp device ---
@@ -120,6 +194,10 @@ pub async fn run(
         sockets.add(sock)
     };
 
+    // Wrap the TUN fd in AsyncFd for readability notifications before
+    // spawning any background accept tasks.
+    let async_fd = AsyncFd::new(RawFdWrapper(tun_fd)).context("AsyncFd::new for TUN fd")?;
+
     // --- State ---
     let mut fake_dns = FakeDns::new();
     let mut tcp_states: HashMap<SocketHandle, TcpForwardState> = HashMap::new();
@@ -131,8 +209,48 @@ pub async fn run(
     let mut handle_to_endpoint: HashMap<SocketHandle, (Ipv4Addr, u16, Ipv4Addr, u16)> =
         HashMap::new();
 
-    // Wrap the TUN fd in AsyncFd for readability notifications.
-    let async_fd = AsyncFd::new(RawFdWrapper(tun_fd)).context("AsyncFd::new for TUN fd")?;
+    let mut published_states: HashMap<SocketHandle, PublishedTcpState> = HashMap::new();
+    let mut published_handle_to_port: HashMap<SocketHandle, u16> = HashMap::new();
+    let mut published_ports = PublishedPortAllocator::new();
+
+    // Each listener gets a small accept task. Accepted streams are handed back
+    // to this single owner of the smoltcp Interface and SocketSet.
+    let (accepted_tx, mut accepted_rx) = mpsc::channel(PUBLISH_ACCEPT_QUEUE);
+    let mut accept_tasks = Vec::with_capacity(registered_publishes.len());
+    for published in registered_publishes {
+        let listener = published.listener;
+        let tx = accepted_tx.clone();
+        let spec = published.spec;
+        accept_tasks.push(tokio::spawn(async move {
+            loop {
+                match listener.accept().await {
+                    Ok((stream, peer_addr)) => {
+                        if tx
+                            .send(AcceptedPublishedTcp {
+                                stream,
+                                peer_addr,
+                                spec,
+                            })
+                            .await
+                            .is_err()
+                        {
+                            break;
+                        }
+                    }
+                    Err(error) => {
+                        tracing::warn!(
+                            "accept failed on published TCP endpoint {}: {error}",
+                            spec.host_addr()
+                        );
+                        tokio::time::sleep(Duration::from_millis(100)).await;
+                    }
+                }
+            }
+        }));
+    }
+    // Keep one sender alive so recv() remains pending when there are no
+    // publications (or if all accept tasks terminate).
+    let _accepted_tx = accepted_tx;
 
     // --- Main loop ---
 
@@ -152,6 +270,7 @@ pub async fn run(
             .max(Duration::from_millis(1))
             .min(Duration::from_millis(100));
 
+        let mut accepted_connections = Vec::new();
         tokio::select! {
             biased;
             _ = shutdown.changed() => {
@@ -160,12 +279,22 @@ pub async fn run(
                     break;
                 }
             }
+            accepted = accepted_rx.recv() => {
+                if let Some(accepted) = accepted {
+                    accepted_connections.push(accepted);
+                }
+            }
             readable = async_fd.readable() => {
                 if let Ok(mut guard) = readable {
                     guard.clear_ready();
                 }
             }
             _ = tokio::time::sleep(timeout) => {}
+        }
+
+        // Drain connections already accepted without delaying TUN processing.
+        while let Ok(accepted) = accepted_rx.try_recv() {
+            accepted_connections.push(accepted);
         }
 
         // 2. Read packets from TUN into device buffer.
@@ -206,6 +335,56 @@ pub async fn run(
                     }
                 }
             }
+        }
+
+        // 3b. Turn newly accepted host streams into active smoltcp connections
+        // to the namespace TUN address. The TUN gateway and an allocated
+        // ephemeral port are used as the source, so the namespace never sees
+        // the real external peer address.
+        for accepted in accepted_connections {
+            let Some(local_port) = published_ports.allocate() else {
+                tracing::warn!(
+                    "published TCP source-port pool exhausted; dropping connection from {}",
+                    accepted.peer_addr
+                );
+                continue;
+            };
+
+            let rx_buf = tcp::SocketBuffer::new(vec![0u8; TCP_BUF_SIZE]);
+            let tx_buf = tcp::SocketBuffer::new(vec![0u8; TCP_BUF_SIZE]);
+            let mut sock = tcp::Socket::new(rx_buf, tx_buf);
+            let remote = (IpAddress::Ipv4(TUN_ADDR), accepted.spec.namespace_port);
+            let local = (IpAddress::Ipv4(TUN_GW), local_port);
+
+            if let Err(error) = sock.connect(iface.context(), remote, local) {
+                tracing::warn!(
+                    "failed to connect published TCP peer {} to {}:{}: {error}",
+                    accepted.peer_addr,
+                    TUN_ADDR,
+                    accepted.spec.namespace_port
+                );
+                published_ports.release(local_port);
+                continue;
+            }
+
+            let handle = sockets.add(sock);
+            tracing::debug!(
+                "published TCP peer {} -> {}:{} using {}:{} (socket {handle})",
+                accepted.peer_addr,
+                TUN_ADDR,
+                accepted.spec.namespace_port,
+                TUN_GW,
+                local_port
+            );
+            published_states.insert(
+                handle,
+                PublishedTcpState::Connecting {
+                    stream: accepted.stream,
+                    peer_addr: accepted.peer_addr,
+                    created_at: Instant::now(),
+                },
+            );
+            published_handle_to_port.insert(handle, local_port);
         }
 
         // 4. Let smoltcp process packets.
@@ -409,6 +588,67 @@ pub async fn run(
             }
         }
 
+        // 6c. Check namespace-side handshakes for published TCP connections.
+        {
+            let connecting_handles: Vec<SocketHandle> = published_states
+                .iter()
+                .filter_map(|(handle, state)| {
+                    matches!(state, PublishedTcpState::Connecting { .. }).then_some(*handle)
+                })
+                .collect();
+
+            for handle in connecting_handles {
+                let state = published_states.remove(&handle).unwrap();
+                let PublishedTcpState::Connecting {
+                    stream,
+                    peer_addr,
+                    created_at,
+                } = state
+                else {
+                    unreachable!();
+                };
+                let sock = sockets.get_mut::<tcp::Socket>(handle);
+
+                if matches!(
+                    sock.state(),
+                    tcp::State::Established | tcp::State::CloseWait
+                ) {
+                    tracing::info!(
+                        "TCP publish: connected host peer {peer_addr} (socket {handle})"
+                    );
+                    published_states.insert(
+                        handle,
+                        PublishedTcpState::Established(PublishedTcpCtx {
+                            stream,
+                            peer_addr,
+                            host_to_namespace: Vec::new(),
+                            close_after_drain: false,
+                        }),
+                    );
+                } else if matches!(sock.state(), tcp::State::Closed | tcp::State::TimeWait) {
+                    tracing::debug!(
+                        "namespace refused published TCP peer {peer_addr} (socket {handle})"
+                    );
+                    published_states.insert(handle, PublishedTcpState::Closing);
+                } else if created_at.elapsed() >= TCP_HANDSHAKE_TIMEOUT {
+                    tracing::warn!(
+                        "published TCP handshake timed out for host peer {peer_addr} (socket {handle})"
+                    );
+                    sock.abort();
+                    published_states.insert(handle, PublishedTcpState::Closing);
+                } else {
+                    published_states.insert(
+                        handle,
+                        PublishedTcpState::Connecting {
+                            stream,
+                            peer_addr,
+                            created_at,
+                        },
+                    );
+                }
+            }
+        }
+
         // 7. Shuttle data for established connections.
         {
             let mut tmp_buf = vec![0u8; TCP_BUF_SIZE];
@@ -520,6 +760,112 @@ pub async fn run(
             }
         }
 
+        // 7b. Shuttle data for host-to-namespace published connections.
+        {
+            let mut tmp_buf = vec![0u8; TCP_BUF_SIZE];
+            let established_handles: Vec<SocketHandle> = published_states
+                .iter()
+                .filter_map(|(handle, state)| {
+                    matches!(state, PublishedTcpState::Established(_)).then_some(*handle)
+                })
+                .collect();
+
+            for handle in established_handles {
+                let state = published_states.get_mut(&handle).unwrap();
+                let PublishedTcpState::Established(ctx) = state else {
+                    continue;
+                };
+                let sock = sockets.get_mut::<tcp::Socket>(handle);
+                let mut failed = false;
+
+                // --- Host peer -> namespace service ---
+                if !ctx.close_after_drain && ctx.host_to_namespace.len() < TCP_BUF_SIZE {
+                    let space = TCP_BUF_SIZE - ctx.host_to_namespace.len();
+                    match ctx.stream.try_read(&mut tmp_buf[..space]) {
+                        Ok(0) => {
+                            tracing::debug!(
+                                "published TCP host peer {} reached EOF (socket {handle})",
+                                ctx.peer_addr
+                            );
+                            ctx.close_after_drain = true;
+                        }
+                        Ok(read) => ctx.host_to_namespace.extend_from_slice(&tmp_buf[..read]),
+                        Err(ref error) if error.kind() == std::io::ErrorKind::WouldBlock => {}
+                        Err(error) => {
+                            tracing::debug!(
+                                "published TCP read error from host peer {}: {error}",
+                                ctx.peer_addr
+                            );
+                            failed = true;
+                        }
+                    }
+                }
+
+                if !ctx.host_to_namespace.is_empty() && sock.can_send() {
+                    let free_space = TCP_BUF_SIZE.saturating_sub(sock.send_queue());
+                    let send_len = free_space.min(ctx.host_to_namespace.len());
+                    if send_len > 0 {
+                        match sock.send_slice(&ctx.host_to_namespace[..send_len]) {
+                            Ok(sent) => {
+                                ctx.host_to_namespace.drain(..sent);
+                            }
+                            Err(error) => {
+                                tracing::debug!(
+                                    "published TCP send error to namespace for peer {}: {error}",
+                                    ctx.peer_addr
+                                );
+                                failed = true;
+                            }
+                        }
+                    }
+                }
+
+                // --- Namespace service -> host peer ---
+                if sock.can_recv() {
+                    let host_stream = &ctx.stream;
+                    let result = sock.recv(|data| {
+                        if data.is_empty() {
+                            return (0, Ok(0));
+                        }
+                        match host_stream.try_write(data) {
+                            Ok(written) => (written, Ok(written)),
+                            Err(ref error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                                (0, Ok(0))
+                            }
+                            Err(error) => (0, Err(error)),
+                        }
+                    });
+                    if let Ok(Err(error)) = result {
+                        tracing::debug!(
+                            "published TCP write error to host peer {}: {error}",
+                            ctx.peer_addr
+                        );
+                        failed = true;
+                    }
+                }
+
+                // Published connections deliberately do not preserve a TCP
+                // half-close. Once either side reaches EOF, stop host reads and
+                // close the whole bridge after its forwarding queues drain.
+                if !sock.may_recv() && sock.recv_queue() == 0 {
+                    ctx.close_after_drain = true;
+                }
+
+                let namespace_closed =
+                    matches!(sock.state(), tcp::State::Closed | tcp::State::TimeWait);
+                let drained_after_eof = ctx.close_after_drain
+                    && ctx.host_to_namespace.is_empty()
+                    && sock.send_queue() == 0
+                    && sock.recv_queue() == 0;
+                if failed || namespace_closed || drained_after_eof {
+                    if !namespace_closed {
+                        sock.abort();
+                    }
+                    published_states.insert(handle, PublishedTcpState::Closing);
+                }
+            }
+        }
+
         // 8. Drive smoltcp so everything queued during this iteration is
         // actually flushed to the TUN interface:
         //   - DNS responses queued by `dns_sock.send_slice` in step 5,
@@ -561,6 +907,24 @@ pub async fn run(
                 tracing::debug!("cleaned up closed socket {handle}");
             }
         }
+
+        {
+            let closing_handles: Vec<SocketHandle> = published_states
+                .iter()
+                .filter_map(|(handle, state)| {
+                    matches!(state, PublishedTcpState::Closing).then_some(*handle)
+                })
+                .collect();
+
+            for handle in closing_handles {
+                published_states.remove(&handle);
+                sockets.remove(handle);
+                if let Some(port) = published_handle_to_port.remove(&handle) {
+                    published_ports.release(port);
+                }
+                tracing::debug!("cleaned up published TCP socket {handle}");
+            }
+        }
     }
 
     // Abort any in-flight proxy connect tasks so they don't linger past
@@ -569,6 +933,9 @@ pub async fn run(
         if let TcpForwardState::Connecting(jh) = state {
             jh.abort();
         }
+    }
+    for task in accept_tasks {
+        task.abort();
     }
 
     Ok(())
@@ -626,5 +993,33 @@ struct RawFdWrapper(RawFd);
 impl AsRawFd for RawFdWrapper {
     fn as_raw_fd(&self) -> RawFd {
         self.0
+    }
+}
+
+#[cfg(test)]
+mod published_port_tests {
+    use super::*;
+
+    #[test]
+    fn allocator_returns_unique_ports_and_reuses_released_port() {
+        let mut allocator = PublishedPortAllocator::new();
+        let first = allocator.allocate().unwrap();
+        let second = allocator.allocate().unwrap();
+        assert_ne!(first, second);
+
+        allocator.release(first);
+        allocator.next = first;
+        assert_eq!(allocator.allocate(), Some(first));
+    }
+
+    #[test]
+    fn allocator_wraps_and_reports_exhaustion() {
+        let mut allocator = PublishedPortAllocator::new();
+        allocator.next = PUBLISH_PORT_MAX;
+        assert_eq!(allocator.allocate(), Some(PUBLISH_PORT_MAX));
+        assert_eq!(allocator.allocate(), Some(PUBLISH_PORT_MIN));
+
+        while allocator.allocate().is_some() {}
+        assert_eq!(allocator.allocate(), None);
     }
 }
