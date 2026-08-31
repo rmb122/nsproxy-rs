@@ -332,9 +332,8 @@ impl Drop for UnlinkOnDrop {
 /// `target`, then unlink the temp file (mount keeps inode alive).
 fn bind_mount_tmpfile(content: &str, target: &str) -> Result<()> {
     use std::io::Write;
-    use std::os::unix::io::FromRawFd;
 
-    // nix::unistd::mkstemp creates a temp file and returns (RawFd, PathBuf)
+    // nix::unistd::mkstemp creates a temp file and returns (OwnedFd, PathBuf)
     let (fd, path) = nix::unistd::mkstemp("/tmp/nsproxy-XXXXXX").context("mkstemp")?;
 
     // Guard ensures the on-disk path is unlinked on every exit path (success,
@@ -342,8 +341,7 @@ fn bind_mount_tmpfile(content: &str, target: &str) -> Result<()> {
     // inode survives because the mount itself references it.
     let _guard = UnlinkOnDrop(path.clone());
 
-    // SAFETY: mkstemp returns a valid, exclusively-owned fd
-    let mut file = unsafe { std::fs::File::from_raw_fd(fd) };
+    let mut file = std::fs::File::from(fd);
     file.write_all(content.as_bytes())
         .with_context(|| format!("write {:?}", path))?;
     drop(file);

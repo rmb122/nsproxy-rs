@@ -235,8 +235,10 @@ fn main() -> Result<()> {
 /// successful acknowledgement.
 fn read_control_byte(sock: RawFd, label: &str) -> Result<u8> {
     let mut byte = [0u8; 1];
+    // SAFETY: callers keep the setup socket open for the duration of this call.
+    let sock_bfd = unsafe { BorrowedFd::borrow_raw(sock) };
     loop {
-        match read(sock, &mut byte) {
+        match read(sock_bfd, &mut byte) {
             Ok(1) => return Ok(byte[0]),
             Ok(0) => bail!("setup channel closed before {label}"),
             Ok(_) => unreachable!("one-byte read returned more than one byte"),
@@ -309,8 +311,9 @@ fn exec_command(command: &[String]) -> Result<()> {
         .map(|s| CString::new(s.as_str()).context("CString arg"))
         .collect::<Result<_>>()?;
 
-    execvp(&prog, &args).context("execvp")?;
-    unreachable!()
+    execvp(&prog, &args)
+        .context("execvp")
+        .map(|never| match never {})
 }
 
 /// Run the requested command and wait for it plus any orphaned descendants.
