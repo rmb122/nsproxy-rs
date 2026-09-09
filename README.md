@@ -51,6 +51,10 @@ Build
 
 The binary will be at `target/release/nsproxy`.
 
+Run unit tests with `cargo test`. To also run the Linux integration tests on a
+host with user, network, and mount namespace support, `/dev/net/tun`, and
+Python 3, run `cargo test -- --ignored --test-threads=1`.
+
 
 Usage
 -----
@@ -80,6 +84,14 @@ Usage
       nsproxy -x direct -p 127.0.0.1:8443:443/tcp web-server --listen 0.0.0.0:443
       nsproxy -x socks5://127.0.0.1:1080 ssh user@remote-host
       nsproxy -x socks5://127.0.0.1:1080 -r cidr:10.0.0.0/8=direct curl http://internal
+
+Proxy server hostnames are resolved using the host's resolver. The 32-second
+connection timeout covers proxy hostname resolution, TCP connection setup,
+and the complete SOCKS5 or HTTP CONNECT handshake.
+
+SIGTERM, SIGINT, and SIGHUP are forwarded to the managed command tree. The
+reaper waits for descendants to exit and forces termination after a two-second
+grace period if necessary.
 
 
 Routing rules

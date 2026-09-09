@@ -1,5 +1,6 @@
 use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
+use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
 
 use smoltcp::iface::{Interface, SocketHandle, SocketSet};
@@ -132,10 +133,32 @@ impl PublishedTcp {
         }
     }
 
-    /// Wait for one host connection and stage it for the next event-loop tick.
-    pub(super) async fn wait_for_accept(&mut self) {
-        if let Some(accepted) = self.accepted_rx.recv().await {
+    /// Register the event-loop waker only for I/O that can make progress.
+    pub(super) fn poll_ready(
+        &mut self,
+        sockets: &SocketSet<'static>,
+        cx: &mut Context<'_>,
+    ) -> Poll<()> {
+        let mut ready = false;
+        if let Poll::Ready(Some(accepted)) = self.accepted_rx.poll_recv(cx) {
             self.pending.push(accepted);
+            ready = true;
+        }
+        for (handle, state) in &self.states {
+            let State::Established(context) = state else {
+                continue;
+            };
+            if !context.close_after_drain && context.host_to_namespace.len() < TCP_BUF_SIZE {
+                ready |= context.stream.poll_read_ready(cx).is_ready();
+            }
+            if sockets.get::<tcp::Socket>(*handle).can_recv() {
+                ready |= context.stream.poll_write_ready(cx).is_ready();
+            }
+        }
+        if ready {
+            Poll::Ready(())
+        } else {
+            Poll::Pending
         }
     }
 
@@ -385,7 +408,41 @@ impl Drop for PublishedTcp {
 
 #[cfg(test)]
 mod tests {
+    use super::super::tests::{WakeProbe, tcp_pair};
     use super::*;
+    use std::sync::Arc;
+    use std::task::Waker;
+    use tokio::io::AsyncWriteExt;
+
+    #[tokio::test]
+    async fn host_data_wakes_the_event_loop_and_respects_buffer_capacity() {
+        let (stream, mut peer) = tcp_pair().await;
+        let mut sockets = SocketSet::new(vec![]);
+        let handle = sockets.add(new_tcp_socket());
+        let mut published = PublishedTcp::new(Vec::new());
+        published.states.insert(
+            handle,
+            State::Established(ConnectionContext {
+                peer_addr: stream.peer_addr().unwrap(),
+                stream,
+                host_to_namespace: Vec::new(),
+                close_after_drain: false,
+            }),
+        );
+        let probe = Arc::new(WakeProbe::default());
+        let waker = Waker::from(probe.clone());
+        let mut cx = Context::from_waker(&waker);
+        assert!(published.poll_ready(&sockets, &mut cx).is_pending());
+        peer.write_all(b"request").await.unwrap();
+        probe.notified().await;
+        assert!(published.poll_ready(&sockets, &mut cx).is_ready());
+
+        let State::Established(context) = published.states.get_mut(&handle).unwrap() else {
+            unreachable!()
+        };
+        context.host_to_namespace.resize(TCP_BUF_SIZE, 0);
+        assert!(published.poll_ready(&sockets, &mut cx).is_pending());
+    }
 
     #[test]
     fn allocator_returns_unique_ports_and_reuses_released_port() {

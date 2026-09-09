@@ -4,7 +4,7 @@
 ///   - NO_AUTH (0x00) and USERNAME/PASSWORD (0x02) negotiation
 ///   - CONNECT command with ATYP 0x01 (IPv4), 0x03 (domain), 0x04 (IPv6)
 ///   - Domain names are forwarded verbatim to prevent DNS leaks
-use std::net::{IpAddr, SocketAddr};
+use std::net::IpAddr;
 
 use anyhow::{Context, Result, bail};
 use async_trait::async_trait;
@@ -32,7 +32,7 @@ const AUTH_SUCCESS: u8 = 0x00;
 
 /// SOCKS5 connector.
 pub struct Socks5Connector {
-    server: SocketAddr,
+    server: String,
     auth: Option<(String, String)>,
 }
 
@@ -41,7 +41,7 @@ impl Socks5Connector {
     ///
     /// `auth` is an optional `(username, password)` pair.  When provided,
     /// the connector advertises USERNAME/PASSWORD as a supported auth method.
-    pub fn new(server: SocketAddr, auth: Option<(String, String)>) -> Self {
+    pub fn new(server: String, auth: Option<(String, String)>) -> Self {
         Self { server, auth }
     }
 }
@@ -49,22 +49,23 @@ impl Socks5Connector {
 #[async_trait]
 impl ProxyConnector for Socks5Connector {
     async fn connect(&self, target: &ProxyTarget) -> Result<ProxyStream> {
-        let mut stream = TcpStream::connect(self.server)
+        let mut stream = TcpStream::connect(self.server.as_str())
             .await
             .with_context(|| format!("TCP connect to SOCKS5 server {}", self.server))?;
 
         // ── Step 1: Method negotiation ────────────────────────────────────────
-        negotiate_method(&mut stream, self.auth.is_some()).await?;
+        let method = negotiate_method(&mut stream, self.auth.is_some()).await?;
 
         // ── Step 2: Authentication (if required) ──────────────────────────────
-        if let Some((user, pass)) = &self.auth {
+        if method == METHOD_USER_PASS {
+            let (user, pass) = self.auth.as_ref().context("SOCKS5: missing credentials")?;
             authenticate(&mut stream, user, pass).await?;
         }
 
         // ── Step 3: CONNECT request ───────────────────────────────────────────
         send_connect_request(&mut stream, target).await?;
 
-        Ok(ProxyStream { inner: stream })
+        Ok(ProxyStream::new(stream, Vec::new()))
     }
 }
 
@@ -74,7 +75,7 @@ impl ProxyConnector for Socks5Connector {
 ///
 /// Client → Server: `VER NMETHODS METHODS…`
 /// Server → Client: `VER METHOD`
-async fn negotiate_method(stream: &mut TcpStream, has_auth: bool) -> Result<()> {
+async fn negotiate_method(stream: &mut TcpStream, has_auth: bool) -> Result<u8> {
     // Build client greeting.
     let methods: &[u8] = if has_auth {
         &[METHOD_NO_AUTH, METHOD_USER_PASS]
@@ -125,7 +126,7 @@ async fn negotiate_method(stream: &mut TcpStream, has_auth: bool) -> Result<()> 
         }
     }
 
-    Ok(())
+    Ok(resp[1])
 }
 
 /// Perform RFC 1929 username/password authentication.
@@ -285,5 +286,62 @@ fn socks5_reply_message(rep: u8) -> &'static str {
         0x07 => "command not supported",
         0x08 => "address type not supported",
         _ => "unknown error",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::proxy::ProxyConfig;
+    use tokio::net::TcpListener;
+
+    async fn connect_with_selected_method(method: u8) {
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            // Exercise host-side hostname resolution, including address fallback.
+            let config = ProxyConfig::parse(&format!(
+                "socks5://user:pass@localhost:{}",
+                listener.local_addr().unwrap().port()
+            ))
+            .unwrap();
+            let target = ProxyTarget::Ip {
+                addr: "1.2.3.4".parse().unwrap(),
+                port: 80,
+            };
+            let server = async {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let mut greeting = [0; 4];
+                stream.read_exact(&mut greeting).await.unwrap();
+                assert_eq!(greeting, [5, 2, 0, 2]);
+                stream.write_all(&[5, method]).await.unwrap();
+                if method == METHOD_USER_PASS {
+                    let mut auth = [0; 11];
+                    stream.read_exact(&mut auth).await.unwrap();
+                    assert_eq!(&auth, b"\x01\x04user\x04pass");
+                    stream.write_all(&[1, 0]).await.unwrap();
+                }
+                let mut connect = [0; 10];
+                stream.read_exact(&mut connect).await.unwrap();
+                assert_eq!(connect, [5, 1, 0, 1, 1, 2, 3, 4, 0, 80]);
+                stream
+                    .write_all(&[5, 0, 0, 1, 127, 0, 0, 1, 0, 0])
+                    .await
+                    .unwrap();
+            };
+            let (connected, ()) = tokio::join!(config.connect(&target), server);
+            connected.unwrap();
+        })
+        .await
+        .expect("SOCKS5 handshake must complete");
+    }
+
+    #[tokio::test]
+    async fn credentials_with_no_auth_selection_send_connect_immediately() {
+        connect_with_selected_method(METHOD_NO_AUTH).await;
+    }
+
+    #[tokio::test]
+    async fn user_pass_selection_authenticates_before_connect() {
+        connect_with_selected_method(METHOD_USER_PASS).await;
     }
 }

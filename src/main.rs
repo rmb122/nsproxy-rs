@@ -3,19 +3,20 @@ mod event_loop;
 mod fake_dns;
 mod fd_passing;
 mod namespace;
+mod process;
 mod proxy;
 mod publish;
 mod rule;
 mod tun;
 
-use std::ffi::CString;
 use std::os::unix::io::{BorrowedFd, IntoRawFd, RawFd};
 
 use anyhow::{Context, Result, bail};
 use clap::Parser;
 use nix::sys::socket::{AddressFamily, SockFlag, SockType, socketpair};
 use nix::sys::wait::{WaitStatus, waitpid};
-use nix::unistd::{ForkResult, Pid, close, execvp, fork, read, write};
+use nix::unistd::{ForkResult, close, fork, read, write};
+use tokio::signal::unix::{SignalKind, signal};
 use tracing::Level;
 
 use config::Config;
@@ -296,100 +297,7 @@ fn child_main(sock: RawFd, config: &Config) -> Result<i32> {
 
     // 10. Run the command under a small reaper so forked descendants keep the
     // proxy alive after the original command process exits.
-    run_command_tree(&config.command).context("run command tree")
-}
-
-/// Replace the current process with the requested command.
-fn exec_command(command: &[String]) -> Result<()> {
-    if command.is_empty() {
-        bail!("no command specified");
-    }
-
-    let prog = CString::new(command[0].as_str()).context("CString prog")?;
-    let args: Vec<CString> = command
-        .iter()
-        .map(|s| CString::new(s.as_str()).context("CString arg"))
-        .collect::<Result<_>>()?;
-
-    execvp(&prog, &args)
-        .context("execvp")
-        .map(|never| match never {})
-}
-
-/// Run the requested command and wait for it plus any orphaned descendants.
-fn run_command_tree(command: &[String]) -> Result<i32> {
-    set_child_subreaper().context("set child subreaper")?;
-
-    // SAFETY: still single-threaded in the namespace child; tokio only starts
-    // in the outer parent process.
-    let command_pid = match unsafe { fork() }.context("fork command")? {
-        ForkResult::Child => {
-            if let Err(e) = exec_command(command) {
-                eprintln!("nsproxy: {:#}", e);
-                std::process::exit(1);
-            }
-
-            unreachable!()
-        }
-        ForkResult::Parent { child } => child,
-    };
-
-    wait_for_command_tree(command_pid)
-}
-
-fn set_child_subreaper() -> Result<()> {
-    let rc = unsafe {
-        libc::prctl(
-            libc::PR_SET_CHILD_SUBREAPER,
-            1 as libc::c_ulong,
-            0 as libc::c_ulong,
-            0 as libc::c_ulong,
-            0 as libc::c_ulong,
-        )
-    };
-
-    if rc == -1 {
-        return Err(std::io::Error::last_os_error()).context("prctl(PR_SET_CHILD_SUBREAPER)");
-    }
-
-    Ok(())
-}
-
-fn wait_for_command_tree(command_pid: Pid) -> Result<i32> {
-    let mut command_exit_code = None;
-
-    loop {
-        match waitpid(Pid::from_raw(-1), None) {
-            Ok(WaitStatus::Exited(pid, code)) => {
-                if pid == command_pid {
-                    tracing::info!("child: command exited with code {code}");
-                    command_exit_code = Some(code);
-                } else {
-                    tracing::debug!("child: descendant {pid} exited with code {code}");
-                }
-            }
-            Ok(WaitStatus::Signaled(pid, sig, _)) => {
-                let code = 128 + sig as i32;
-                if pid == command_pid {
-                    tracing::info!("child: command killed by signal {sig}");
-                    command_exit_code = Some(code);
-                } else {
-                    tracing::debug!("child: descendant {pid} killed by signal {sig}");
-                }
-            }
-            Ok(status) => {
-                tracing::debug!("child: process status {status:?}, continuing wait");
-            }
-            Err(nix::errno::Errno::EINTR) => continue,
-            Err(nix::errno::Errno::ECHILD) => {
-                return command_exit_code
-                    .ok_or_else(|| anyhow::anyhow!("command process exited without status"));
-            }
-            Err(e) => {
-                return Err(anyhow::anyhow!("waitpid: {e}"));
-            }
-        }
-    }
+    process::run_command_tree(&config.command).context("run command tree")
 }
 
 // ── Parent logic ─────────────────────────────────────────────────────────────
@@ -441,9 +349,14 @@ fn parent_main(sock: RawFd, child: nix::unistd::Pid, config: Config) -> Result<(
         .enable_all()
         .build()
         .context("build tokio runtime")?;
-    let registered_publishes = {
+    let (registered_publishes, mut terminate, mut interrupt, mut hangup) = {
         let _runtime_guard = rt.enter();
-        publish::register_publish_specs(bound_publishes).context("register --publish")?
+        (
+            publish::register_publish_specs(bound_publishes).context("register --publish")?,
+            signal(SignalKind::terminate()).context("listen for SIGTERM")?,
+            signal(SignalKind::interrupt()).context("listen for SIGINT")?,
+            signal(SignalKind::hangup()).context("listen for SIGHUP")?,
+        )
     };
 
     // 6. Signal child that we are ready (send byte 0x01).
@@ -465,7 +378,7 @@ fn parent_main(sock: RawFd, child: nix::unistd::Pid, config: Config) -> Result<(
 
         // Wait for child to exit (in a blocking fashion on a separate thread).
         let child_pid = child;
-        let child_wait = tokio::task::spawn_blocking(move || -> Result<i32> {
+        let mut child_wait = tokio::task::spawn_blocking(move || -> Result<i32> {
             loop {
                 match waitpid(child_pid, None) {
                     Ok(WaitStatus::Exited(_, code)) => {
@@ -488,8 +401,20 @@ fn parent_main(sock: RawFd, child: nix::unistd::Pid, config: Config) -> Result<(
             }
         });
 
-        // Wait for child exit.
-        let exit_code = match child_wait.await {
+        // Keep forwarding traffic while the reaper terminates and collects
+        // the command tree, including descendants that outlive the command.
+        let child_status = loop {
+            let received = tokio::select! {
+                result = &mut child_wait => break result,
+                _ = terminate.recv() => nix::sys::signal::Signal::SIGTERM,
+                _ = interrupt.recv() => nix::sys::signal::Signal::SIGINT,
+                _ = hangup.recv() => nix::sys::signal::Signal::SIGHUP,
+            };
+            if let Err(error) = process::forward_signal(child, received) {
+                tracing::warn!("forward termination signal: {error:#}");
+            }
+        };
+        let exit_code = match child_status {
             Ok(Ok(code)) => code,
             Ok(Err(e)) => {
                 tracing::warn!("child wait error: {e}");

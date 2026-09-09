@@ -29,6 +29,6 @@ impl ProxyConnector for DirectConnector {
         };
 
         tracing::debug!("direct: connected to {}", target);
-        Ok(ProxyStream { inner: stream })
+        Ok(ProxyStream::new(stream, Vec::new()))
     }
 }

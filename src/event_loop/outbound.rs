@@ -1,5 +1,8 @@
 use std::collections::{HashMap, HashSet};
+use std::future::Future;
 use std::net::Ipv4Addr;
+use std::pin::Pin;
+use std::task::{Context, Poll};
 use std::time::Instant;
 
 use anyhow::Result;
@@ -94,8 +97,34 @@ impl OutboundTcp {
     ) {
         self.log_listener_transitions(sockets);
         self.update_listeners(sockets, dns, config);
-        self.poll_connecting(sockets);
         self.shuttle_established(sockets);
+    }
+
+    pub(super) fn poll_ready(
+        &mut self,
+        sockets: &mut SocketSet<'static>,
+        cx: &mut Context<'_>,
+    ) -> Poll<()> {
+        let mut ready = self.poll_connecting(sockets, cx);
+        for (handle, state) in &self.states {
+            let State::Established(context) = state else {
+                continue;
+            };
+            let socket = sockets.get::<tcp::Socket>(*handle);
+            if context.proxy_read_state == ProxyReadState::Open
+                && context.proxy_to_app.len() < TCP_BUF_SIZE
+            {
+                ready |= context.stream.poll_read_ready(cx).is_ready();
+            }
+            if socket.can_recv() {
+                ready |= context.stream.inner.poll_write_ready(cx).is_ready();
+            }
+        }
+        if ready {
+            Poll::Ready(())
+        } else {
+            Poll::Pending
+        }
     }
 
     fn log_listener_transitions(&self, sockets: &SocketSet<'static>) {
@@ -154,7 +183,8 @@ impl OutboundTcp {
         }
     }
 
-    fn poll_connecting(&mut self, sockets: &mut SocketSet<'static>) {
+    fn poll_connecting(&mut self, sockets: &mut SocketSet<'static>, cx: &mut Context<'_>) -> bool {
+        let mut ready = false;
         let handles: Vec<_> = self
             .states
             .iter()
@@ -165,8 +195,9 @@ impl OutboundTcp {
             let State::Connecting(mut task) = self.states.remove(&handle).unwrap() else {
                 unreachable!();
             };
-            match task.try_poll() {
-                Some(Ok(Ok(stream))) => {
+            match Pin::new(&mut task).poll(cx) {
+                Poll::Ready(Ok(Ok(stream))) => {
+                    ready = true;
                     tracing::debug!("proxy connection established for socket {handle}");
                     self.states.insert(
                         handle,
@@ -177,17 +208,19 @@ impl OutboundTcp {
                         }),
                     );
                 }
-                Some(Ok(Err(error))) => {
+                Poll::Ready(Ok(Err(error))) => {
+                    ready = true;
                     tracing::warn!("proxy connect failed: {error:#}");
                     sockets.get_mut::<tcp::Socket>(handle).abort();
                     self.states.insert(handle, State::Closing);
                 }
-                Some(Err(error)) => {
+                Poll::Ready(Err(error)) => {
+                    ready = true;
                     tracing::warn!("proxy connect task panicked: {error}");
                     sockets.get_mut::<tcp::Socket>(handle).abort();
                     self.states.insert(handle, State::Closing);
                 }
-                None => {
+                Poll::Pending => {
                     let socket = sockets.get_mut::<tcp::Socket>(handle);
                     let client_gone = matches!(
                         socket.state(),
@@ -199,6 +232,7 @@ impl OutboundTcp {
                             | tcp::State::LastAck
                     );
                     if client_gone {
+                        ready = true;
                         tracing::debug!(
                             "client gone while proxy connecting (socket {handle}, state {:?}); aborting connect",
                             socket.state()
@@ -212,6 +246,7 @@ impl OutboundTcp {
                 }
             }
         }
+        ready
     }
 
     fn shuttle_established(&mut self, sockets: &mut SocketSet<'static>) {
@@ -252,7 +287,7 @@ impl OutboundTcp {
                 && context.proxy_to_app.len() < TCP_BUF_SIZE
             {
                 let space = TCP_BUF_SIZE - context.proxy_to_app.len();
-                match context.stream.inner.try_read(&mut tmp_buf[..space]) {
+                match context.stream.try_read(&mut tmp_buf[..space]) {
                     Ok(0) => {
                         tracing::debug!("proxy stream closed for socket {handle}");
                         context.proxy_read_state = ProxyReadState::Eof;
@@ -328,34 +363,103 @@ impl Drop for OutboundTcp {
     }
 }
 
-trait JoinHandlePoll {
-    type Output;
-    fn try_poll(&mut self) -> Option<Self::Output>;
-}
+#[cfg(test)]
+mod tests {
+    use super::super::tests::{WakeProbe, tcp_pair};
+    use super::*;
+    use crate::proxy::{ProxyConfig, ProxyTarget};
+    use std::sync::Arc;
+    use std::task::Waker;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpListener;
 
-impl<T> JoinHandlePoll for tokio::task::JoinHandle<T> {
-    type Output = Result<T, tokio::task::JoinError>;
+    #[tokio::test]
+    async fn upstream_data_wakes_the_event_loop_and_respects_buffer_capacity() {
+        let (stream, mut peer) = tcp_pair().await;
+        let mut sockets = SocketSet::new(vec![]);
+        let handle = sockets.add(new_tcp_socket());
+        let mut outbound = OutboundTcp::new();
+        outbound.states.insert(
+            handle,
+            State::Established(ForwardContext {
+                stream: ProxyStream::new(stream, Vec::new()),
+                proxy_to_app: Vec::new(),
+                proxy_read_state: ProxyReadState::Open,
+            }),
+        );
+        let probe = Arc::new(WakeProbe::default());
+        let waker = Waker::from(probe.clone());
+        let mut cx = Context::from_waker(&waker);
+        assert!(outbound.poll_ready(&mut sockets, &mut cx).is_pending());
+        peer.write_all(b"response").await.unwrap();
+        probe.notified().await;
+        assert!(outbound.poll_ready(&mut sockets, &mut cx).is_ready());
 
-    fn try_poll(&mut self) -> Option<Self::Output> {
-        use std::future::Future;
-        use std::pin::Pin;
-        use std::task::{Context, Poll, RawWaker, RawWakerVTable, Waker};
+        let State::Established(context) = outbound.states.get_mut(&handle).unwrap() else {
+            unreachable!()
+        };
+        context.proxy_to_app.resize(TCP_BUF_SIZE, 0);
+        assert!(outbound.poll_ready(&mut sockets, &mut cx).is_pending());
+    }
 
-        fn noop_raw_waker() -> RawWaker {
-            fn no_op(_: *const ()) {}
-            fn clone(pointer: *const ()) -> RawWaker {
-                RawWaker::new(pointer, &VTABLE)
-            }
-            const VTABLE: RawWakerVTable = RawWakerVTable::new(clone, no_op, no_op, no_op);
-            RawWaker::new(std::ptr::null(), &VTABLE)
-        }
+    #[tokio::test]
+    async fn completed_connect_wakes_the_event_loop() {
+        let (stream, _peer) = tcp_pair().await;
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let mut sockets = SocketSet::new(vec![]);
+        let mut socket = new_tcp_socket();
+        socket.listen(12345).unwrap();
+        let handle = sockets.add(socket);
+        let mut outbound = OutboundTcp::new();
+        outbound.states.insert(
+            handle,
+            State::Connecting(tokio::spawn(async move {
+                rx.await?;
+                Ok(ProxyStream::new(stream, Vec::new()))
+            })),
+        );
+        let probe = Arc::new(WakeProbe::default());
+        let waker = Waker::from(probe.clone());
+        let mut cx = Context::from_waker(&waker);
+        assert!(outbound.poll_ready(&mut sockets, &mut cx).is_pending());
+        tx.send(()).unwrap();
+        probe.notified().await;
+        assert!(outbound.poll_ready(&mut sockets, &mut cx).is_ready());
+        assert!(matches!(outbound.states[&handle], State::Established(_)));
+    }
 
-        let waker = unsafe { Waker::from_raw(noop_raw_waker()) };
-        let mut context = Context::from_waker(&waker);
-        let pinned = unsafe { Pin::new_unchecked(self) };
-        match pinned.poll(&mut context) {
-            Poll::Ready(result) => Some(result),
-            Poll::Pending => None,
-        }
+    #[tokio::test]
+    async fn timed_out_proxy_connect_is_aborted_and_removed() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let proxy =
+            ProxyConfig::parse(&format!("http://{}", listener.local_addr().unwrap())).unwrap();
+        let target = ProxyTarget::Domain {
+            host: "example.test".into(),
+            port: 80,
+        };
+        let mut sockets = SocketSet::new(vec![]);
+        let mut socket = new_tcp_socket();
+        socket.listen(12345).unwrap();
+        let handle = sockets.add(socket);
+        let mut outbound = OutboundTcp::new();
+        outbound.states.insert(
+            handle,
+            State::Connecting(tokio::spawn(async move { proxy.connect(&target).await })),
+        );
+        let (mut peer, _) = listener.accept().await.unwrap();
+        let mut request = [0; 1024];
+        assert!(peer.read(&mut request).await.unwrap() > 0);
+        tokio::time::pause();
+        tokio::time::advance(std::time::Duration::from_secs(32)).await;
+        std::future::poll_fn(|cx| outbound.poll_ready(&mut sockets, cx)).await;
+        tokio::time::resume();
+        assert!(matches!(outbound.states[&handle], State::Closing));
+        assert_eq!(
+            sockets.get::<tcp::Socket>(handle).state(),
+            tcp::State::Closed
+        );
+        outbound.cleanup(&mut sockets);
+        assert!(outbound.states.is_empty());
+        assert_eq!(sockets.iter().count(), 0);
     }
 }

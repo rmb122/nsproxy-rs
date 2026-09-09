@@ -6,6 +6,7 @@ mod outbound;
 mod published;
 
 use std::os::unix::io::{AsRawFd, RawFd};
+use std::task::Poll;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
@@ -101,8 +102,8 @@ impl EventLoop {
         tracing::info!("event_loop: shutdown signal received");
     }
 
-    /// Wait for TUN input, a host-side accepted connection, shutdown, or the
-    /// next smoltcp timer deadline.
+    /// Wait for TUN input, stream readiness, completed connects, accepted
+    /// connections, shutdown, or the next smoltcp timer deadline.
     async fn wait_for_work(&mut self, shutdown: &mut tokio::sync::watch::Receiver<bool>) -> bool {
         if *shutdown.borrow() {
             return false;
@@ -119,7 +120,15 @@ impl EventLoop {
         tokio::select! {
             biased;
             _ = shutdown.changed() => {}
-            _ = self.published.wait_for_accept() => {}
+            _ = std::future::poll_fn(|cx| {
+                let outbound = self.outbound.poll_ready(&mut self.sockets, cx);
+                let published = self.published.poll_ready(&self.sockets, cx);
+                if outbound.is_ready() || published.is_ready() {
+                    Poll::Ready(())
+                } else {
+                    Poll::Pending
+                }
+            }) => {}
             readable = self.async_fd.readable() => {
                 if let Ok(mut guard) = readable {
                     guard.clear_ready();
@@ -174,5 +183,45 @@ struct RawFdWrapper(RawFd);
 impl AsRawFd for RawFdWrapper {
     fn as_raw_fd(&self) -> RawFd {
         self.0
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+    use std::task::Wake;
+    use std::time::Duration;
+
+    use tokio::net::{TcpListener, TcpStream};
+    use tokio::sync::Notify;
+
+    #[derive(Default)]
+    pub(super) struct WakeProbe(Notify);
+
+    impl Wake for WakeProbe {
+        fn wake(self: Arc<Self>) {
+            self.0.notify_one();
+        }
+
+        fn wake_by_ref(self: &Arc<Self>) {
+            self.0.notify_one();
+        }
+    }
+
+    impl WakeProbe {
+        pub(super) async fn notified(&self) {
+            tokio::time::timeout(Duration::from_secs(2), self.0.notified())
+                .await
+                .expect("I/O must wake the event loop without a polling timer");
+        }
+    }
+
+    pub(super) async fn tcp_pair() -> (TcpStream, TcpStream) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let (client, server) = tokio::join!(
+            TcpStream::connect(listener.local_addr().unwrap()),
+            listener.accept(),
+        );
+        (client.unwrap(), server.unwrap().0)
     }
 }

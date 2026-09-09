@@ -10,7 +10,7 @@ use std::collections::HashSet;
 use std::ffi::CString;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::os::unix::ffi::OsStrExt;
-use std::os::unix::fs::MetadataExt;
+use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
@@ -119,19 +119,10 @@ fn inspect_bind_path(
     Ok((path, identity))
 }
 
-// ── ifreq (simplified — only the fields we need) ─────────────────────────────
-
-#[repr(C)]
-struct Ifreq {
-    ifr_name: [libc::c_char; libc::IF_NAMESIZE],
-    ifr_data: libc::c_int,
-}
-
-fn ifreq_for(name: &str) -> Ifreq {
-    let mut ifr = Ifreq {
-        ifr_name: [0; libc::IF_NAMESIZE],
-        ifr_data: 0,
-    };
+fn ifreq_for(name: &str) -> libc::ifreq {
+    // The kernel accesses the complete ifreq, including its union and padding.
+    // SAFETY: all-zero bytes are valid for libc::ifreq.
+    let mut ifr: libc::ifreq = unsafe { std::mem::zeroed() };
     for (i, byte) in name.bytes().enumerate().take(libc::IF_NAMESIZE - 1) {
         ifr.ifr_name[i] = byte as libc::c_char;
     }
@@ -344,6 +335,8 @@ fn bind_mount_tmpfile(content: &str, target: &str) -> Result<()> {
     let mut file = std::fs::File::from(fd);
     file.write_all(content.as_bytes())
         .with_context(|| format!("write {:?}", path))?;
+    file.set_permissions(std::fs::Permissions::from_mode(0o644))
+        .context("make internal DNS configuration readable by all users")?;
     drop(file);
 
     // Bind-mount
@@ -448,11 +441,11 @@ pub fn create_tun() -> Result<RawFd> {
         fd
     };
 
-    // TUNSETIFF — request a TUN (not TAP) device, no packet info header
+    // TUNSETIFF requests a TUN device without a packet information header.
     let mut ifr = ifreq_for(TUN_NAME);
-    ifr.ifr_data = IFF_TUN | IFF_NO_PI;
+    ifr.ifr_ifru.ifru_flags = (IFF_TUN | IFF_NO_PI) as libc::c_short;
 
-    let ret = unsafe { libc::ioctl(fd, TUNSETIFF as _, &mut ifr as *mut Ifreq) };
+    let ret = unsafe { libc::ioctl(fd, TUNSETIFF as _, &mut ifr as *mut libc::ifreq) };
     if ret == -1 {
         let e = std::io::Error::last_os_error();
         unsafe { libc::close(fd) };
@@ -567,6 +560,81 @@ pub fn create_tun() -> Result<RawFd> {
         TUN_GW
     );
     Ok(fd)
+}
+
+#[cfg(test)]
+mod tun_tests {
+    use super::*;
+
+    #[test]
+    #[ignore = "requires Linux user/network namespaces and /dev/net/tun"]
+    fn tun_ioctl_accepts_request_at_guard_page_boundary() {
+        if std::env::var_os("NSPROXY_TUN_ABI_TEST_CHILD").is_none() {
+            let output = std::process::Command::new("unshare")
+                .arg("-Urn")
+                .arg(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "namespace::tun_tests::tun_ioctl_accepts_request_at_guard_page_boundary",
+                    "--ignored",
+                    "--nocapture",
+                ])
+                .env("NSPROXY_TUN_ABI_TEST_CHILD", "1")
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            return;
+        }
+
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open("/dev/net/tun")
+            .unwrap();
+        let request = ifreq_for(TUN_NAME);
+        let request_size = std::mem::size_of_val(&request);
+        // SAFETY: the request occupies the end of a writable mapping followed
+        // by a protected page. A short ifreq causes ioctl to return EFAULT.
+        unsafe {
+            let page_size = libc::sysconf(libc::_SC_PAGESIZE) as usize;
+            let mapping = libc::mmap(
+                std::ptr::null_mut(),
+                page_size * 2,
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
+                -1,
+                0,
+            );
+            assert_ne!(mapping, libc::MAP_FAILED);
+            assert_eq!(
+                libc::mprotect(
+                    mapping.cast::<u8>().add(page_size).cast(),
+                    page_size,
+                    libc::PROT_NONE
+                ),
+                0
+            );
+            let buffer = mapping.cast::<u8>().add(page_size - request_size);
+            std::ptr::copy_nonoverlapping(
+                std::ptr::from_ref(&request).cast::<u8>(),
+                buffer,
+                request_size,
+            );
+            buffer
+                .add(libc::IF_NAMESIZE)
+                .cast::<libc::c_short>()
+                .write_unaligned((IFF_TUN | IFF_NO_PI) as libc::c_short);
+            let result = libc::ioctl(file.as_raw_fd(), TUNSETIFF, buffer);
+            let error = std::io::Error::last_os_error();
+            libc::munmap(mapping, page_size * 2);
+            assert_eq!(result, 0, "TUNSETIFF rejected the request: {error}");
+        }
+    }
 }
 
 #[cfg(test)]

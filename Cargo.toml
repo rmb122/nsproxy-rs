@@ -21,6 +21,9 @@ async-trait = "0.1"
 libc = "0.2"
 regex = "1"
 
+[dev-dependencies]
+tokio = { version = "1", features = ["test-util"] }
+
 [profile.release]
 lto = true
 strip = true

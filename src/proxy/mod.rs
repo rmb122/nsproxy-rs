@@ -4,22 +4,26 @@ pub mod socks5;
 
 use anyhow::{Context as _, Result, bail};
 use async_trait::async_trait;
+use std::io::{self, Cursor, Read};
 use std::net::{IpAddr, SocketAddr};
 use std::pin::Pin;
 use std::task::{Context, Poll};
+use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::net::TcpStream;
+
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(32);
 
 /// A fully parsed outbound route.
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub enum ProxyConfig {
     Direct,
     Socks5 {
-        addr: SocketAddr,
+        addr: String,
         auth: Option<(String, String)>,
     },
     Http {
-        addr: SocketAddr,
+        addr: String,
         auth: Option<(String, String)>,
     },
 }
@@ -63,9 +67,21 @@ impl ProxyConfig {
             (None, rest)
         };
 
-        let addr: SocketAddr = host_port
-            .parse()
-            .with_context(|| format!("invalid proxy address: '{host_port}'"))?;
+        if host_port.parse::<SocketAddr>().is_err() {
+            let (host, port) = host_port
+                .rsplit_once(':')
+                .with_context(|| format!("invalid proxy address: '{host_port}'"))?;
+            if host.is_empty()
+                || host.contains([':', '/', '?', '#', '[', ']'])
+                || host.chars().any(char::is_whitespace)
+            {
+                bail!("invalid proxy hostname: '{host}'");
+            }
+            port.parse::<u16>()
+                .with_context(|| format!("invalid proxy port: '{port}'"))?;
+        }
+        // Resolve proxy hostnames asynchronously on the host when connecting.
+        let addr = host_port.to_owned();
 
         Ok(match kind {
             Kind::Socks5 => Self::Socks5 { addr, auth },
@@ -74,15 +90,21 @@ impl ProxyConfig {
     }
 
     pub async fn connect(&self, target: &ProxyTarget) -> Result<ProxyStream> {
+        tokio::time::timeout(CONNECT_TIMEOUT, self.connect_inner(target))
+            .await
+            .context("upstream connection timed out after 32 seconds")?
+    }
+
+    async fn connect_inner(&self, target: &ProxyTarget) -> Result<ProxyStream> {
         match self {
             Self::Direct => direct::DirectConnector.connect(target).await,
             Self::Socks5 { addr, auth } => {
-                socks5::Socks5Connector::new(*addr, auth.clone())
+                socks5::Socks5Connector::new(addr.clone(), auth.clone())
                     .connect(target)
                     .await
             }
             Self::Http { addr, auth } => {
-                http::HttpConnector::new(*addr, auth.clone())
+                http::HttpConnector::new(addr.clone(), auth.clone())
                     .connect(target)
                     .await
             }
@@ -127,6 +149,36 @@ pub trait ProxyConnector: Send + Sync {
 /// Bidirectional stream after proxy handshake completes.
 pub struct ProxyStream {
     pub inner: TcpStream,
+    buffered: Cursor<Vec<u8>>,
+}
+
+impl ProxyStream {
+    pub(crate) fn new(inner: TcpStream, buffered: Vec<u8>) -> Self {
+        Self {
+            inner,
+            buffered: Cursor::new(buffered),
+        }
+    }
+
+    fn has_buffered_data(&self) -> bool {
+        self.buffered.position() < self.buffered.get_ref().len() as u64
+    }
+
+    pub fn try_read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        if self.has_buffered_data() {
+            self.buffered.read(buf)
+        } else {
+            self.inner.try_read(buf)
+        }
+    }
+
+    pub fn poll_read_ready(&self, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        if self.has_buffered_data() {
+            Poll::Ready(Ok(()))
+        } else {
+            self.inner.poll_read_ready(cx)
+        }
+    }
 }
 
 impl AsyncRead for ProxyStream {
@@ -135,6 +187,11 @@ impl AsyncRead for ProxyStream {
         cx: &mut Context<'_>,
         buf: &mut ReadBuf<'_>,
     ) -> Poll<std::io::Result<()>> {
+        if self.has_buffered_data() {
+            let read = self.buffered.read(buf.initialize_unfilled())?;
+            buf.advance(read);
+            return Poll::Ready(Ok(()));
+        }
         Pin::new(&mut self.inner).poll_read(cx, buf)
     }
 }
@@ -179,5 +236,60 @@ mod config_tests {
         assert!(ProxyConfig::parse("").is_err());
         assert!(ProxyConfig::parse("ftp://127.0.0.1:21").is_err());
         assert!(ProxyConfig::parse("socks5://not-an-address").is_err());
+    }
+
+    #[test]
+    fn parses_hostname_and_ipv6_proxy_addresses_without_resolving_targets() {
+        for url in [
+            "socks5://localhost:1080",
+            "http://user:pass@proxy:8080",
+            "http://[::1]:8080",
+        ] {
+            assert!(ProxyConfig::parse(url).is_ok(), "{url}");
+        }
+        for url in [
+            "http://:80",
+            "http://host:invalid",
+            "http://host:65536",
+            "http://::1:80",
+        ] {
+            assert!(ProxyConfig::parse(url).is_err(), "{url}");
+        }
+    }
+
+    #[tokio::test]
+    async fn stalled_proxy_handshakes_time_out_and_close_the_stream() {
+        use tokio::io::AsyncReadExt;
+        use tokio::net::TcpListener;
+
+        for scheme in ["socks5", "http"] {
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let config =
+                ProxyConfig::parse(&format!("{scheme}://{}", listener.local_addr().unwrap()))
+                    .unwrap();
+            let target = ProxyTarget::Domain {
+                host: "example.test".into(),
+                port: 80,
+            };
+            let connect = tokio::spawn(async move { config.connect(&target).await });
+            let (mut peer, _) = listener.accept().await.unwrap();
+            let mut request = [0; 1024];
+            assert!(peer.read(&mut request).await.unwrap() > 0);
+
+            tokio::time::pause();
+            tokio::time::advance(CONNECT_TIMEOUT).await;
+            let error = connect
+                .await
+                .unwrap()
+                .err()
+                .expect("handshake must time out");
+            tokio::time::resume();
+            assert!(error.to_string().contains("timed out"));
+            let read = tokio::time::timeout(Duration::from_secs(2), peer.read(&mut request))
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(read, 0, "timed-out handshake must release its TCP stream");
+        }
     }
 }

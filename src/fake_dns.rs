@@ -209,9 +209,11 @@ pub fn build_empty_response(id: u16, domain: &str, qtype: u16) -> Vec<u8> {
 /// Encode a dotted-label domain name into the DNS wire format
 /// (length-prefixed labels terminated by a zero byte).
 fn encode_name(buf: &mut Vec<u8>, domain: &str) {
-    for label in domain.split('.') {
-        buf.push(label.len() as u8);
-        buf.extend_from_slice(label.as_bytes());
+    if !domain.is_empty() {
+        for label in domain.split('.') {
+            buf.push(label.len() as u8);
+            buf.extend_from_slice(label.as_bytes());
+        }
     }
     buf.push(0); // root label terminator
 }
@@ -362,6 +364,19 @@ mod tests {
         assert_eq!(id, 0xBEEF);
         assert_eq!(domain, "ipv6.example.com");
         assert_eq!(qtype, 28);
+    }
+
+    #[test]
+    fn root_ns_query_preserves_question_wire_format() {
+        // Construct the wire query independently of encode_name.
+        let query = [0x12, 0x34, 1, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 2, 0, 1];
+        let (id, domain, qtype) = parse_query(&query).unwrap();
+        assert_eq!(domain, "");
+        assert_eq!(qtype, 2);
+
+        let response = build_empty_response(id, &domain, qtype);
+        assert_eq!(&response[12..], &query[12..]);
+        assert_eq!(response.len(), 17);
     }
 
     #[test]

@@ -6,8 +6,6 @@
 ///
 /// After the proxy returns 200 the TCP connection is a raw tunnel to the
 /// target.  No extra dependencies — base64 encoding is inlined.
-use std::net::SocketAddr;
-
 use anyhow::{Context, Result, bail};
 use async_trait::async_trait;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
@@ -19,7 +17,7 @@ use super::{ProxyConnector, ProxyStream, ProxyTarget};
 
 /// HTTP CONNECT connector.
 pub struct HttpConnector {
-    server: SocketAddr,
+    server: String,
     auth: Option<(String, String)>,
 }
 
@@ -28,7 +26,7 @@ impl HttpConnector {
     ///
     /// `auth` is an optional `(username, password)` pair used for
     /// `Proxy-Authorization: Basic` authentication.
-    pub fn new(server: SocketAddr, auth: Option<(String, String)>) -> Self {
+    pub fn new(server: String, auth: Option<(String, String)>) -> Self {
         Self { server, auth }
     }
 }
@@ -36,13 +34,11 @@ impl HttpConnector {
 #[async_trait]
 impl ProxyConnector for HttpConnector {
     async fn connect(&self, target: &ProxyTarget) -> Result<ProxyStream> {
-        let stream = TcpStream::connect(self.server)
+        let stream = TcpStream::connect(self.server.as_str())
             .await
             .with_context(|| format!("TCP connect to HTTP proxy {}", self.server))?;
 
-        let stream = do_connect(stream, target, self.auth.as_ref()).await?;
-
-        Ok(ProxyStream { inner: stream })
+        do_connect(stream, target, self.auth.as_ref()).await
     }
 }
 
@@ -52,7 +48,7 @@ async fn do_connect(
     stream: TcpStream,
     target: &ProxyTarget,
     auth: Option<&(String, String)>,
-) -> Result<TcpStream> {
+) -> Result<ProxyStream> {
     let target_str = target.to_string();
 
     // ── Build request ─────────────────────────────────────────────────────────
@@ -69,7 +65,7 @@ async fn do_connect(
     request.push_str("\r\n");
 
     // Wrap in a BufReader for line-oriented response reading.
-    // We need the raw stream back after reading, so we use into_inner().
+    // Preserve any tunnel bytes prefetched while reading the response headers.
     let mut buf_stream = BufReader::new(stream);
 
     buf_stream
@@ -119,10 +115,8 @@ async fn do_connect(
 
     tracing::debug!("HTTP CONNECT: tunnel established to {}", target_str);
 
-    // Return the inner stream (BufReader may have buffered bytes, but for
-    // HTTP CONNECT the proxy MUST NOT send data before the blank line, so the
-    // buffer should be empty at this point).
-    Ok(buf_stream.into_inner())
+    let buffered = buf_stream.buffer().to_vec();
+    Ok(ProxyStream::new(buf_stream.into_inner(), buffered))
 }
 
 /// Extract the three-digit HTTP status code from a status line.
@@ -189,6 +183,50 @@ fn base64_encode(input: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tokio::io::AsyncReadExt;
+    use tokio::net::TcpListener;
+
+    #[tokio::test]
+    async fn coalesced_response_preserves_tunnel_data_across_read_apis() {
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let (client, server) = tokio::join!(
+                TcpStream::connect(listener.local_addr().unwrap()),
+                listener.accept(),
+            );
+            let (mut server, _) = server.unwrap();
+            // Queue the complete response and greeting before the client reads.
+            server
+                .write_all(b"HTTP/1.1 200 OK\r\nProxy-Agent: test\r\n\r\nHELLO")
+                .await
+                .unwrap();
+            let target = ProxyTarget::Domain {
+                host: "example.test".into(),
+                port: 22,
+            };
+            let mut stream = do_connect(client.unwrap(), &target, None).await.unwrap();
+            assert!(
+                stream.has_buffered_data(),
+                "fixture must exercise prefetching"
+            );
+            std::future::poll_fn(|cx| stream.poll_read_ready(cx))
+                .await
+                .unwrap();
+            let mut prefix = [0; 2];
+            assert_eq!(stream.try_read(&mut prefix).unwrap(), 2);
+            assert_eq!(&prefix, b"HE");
+            let mut suffix = [0; 3];
+            stream.read_exact(&mut suffix).await.unwrap();
+            assert_eq!(&suffix, b"LLO");
+
+            server.write_all(b"NEXT").await.unwrap();
+            let mut next = [0; 4];
+            stream.read_exact(&mut next).await.unwrap();
+            assert_eq!(&next, b"NEXT");
+        })
+        .await
+        .expect("tunnel data must remain readable");
+    }
 
     #[test]
     fn base64_rfc4648_vectors() {
