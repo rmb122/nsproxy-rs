@@ -91,7 +91,8 @@ and the complete SOCKS5 or HTTP CONNECT handshake.
 
 SIGTERM, SIGINT, and SIGHUP are forwarded to the managed command tree. The
 reaper waits for descendants to exit and forces termination after a two-second
-grace period if necessary.
+grace period if necessary. Each subsequent termination signal is forwarded as
+received without extending the original grace period.
 
 
 Routing rules

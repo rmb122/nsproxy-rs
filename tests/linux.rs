@@ -24,6 +24,7 @@ fn nsproxy(proxy: &str) -> Command {
 struct ManagedChild {
     child: Child,
     descendants: Vec<Pid>,
+    output: std::sync::mpsc::Receiver<String>,
 }
 
 impl ManagedChild {
@@ -32,28 +33,35 @@ impl ManagedChild {
     }
 
     fn spawn_with_command(mut command: Command, script: &str) -> Self {
-        let child = command
+        let mut child = command
             .args(["python3", "-u", "-c", script])
             .stdout(Stdio::piped())
             .spawn()
             .unwrap();
+        let stdout = child.stdout.take().unwrap();
+        let (tx, output) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            for line in BufReader::new(stdout).lines() {
+                if tx.send(line.unwrap()).is_err() {
+                    break;
+                }
+            }
+        });
         Self {
             child,
             descendants: Vec::new(),
+            output,
         }
     }
 
-    fn read_process_ids(&mut self) {
-        let stdout = self.child.stdout.take().unwrap();
-        let (tx, rx) = std::sync::mpsc::channel();
-        std::thread::spawn(move || {
-            let mut line = String::new();
-            BufReader::new(stdout).read_line(&mut line).unwrap();
-            let _ = tx.send(line);
-        });
-        let line = rx
+    fn read_line(&self) -> String {
+        self.output
             .recv_timeout(Duration::from_secs(10))
-            .expect("command must start");
+            .expect("command must report its progress")
+    }
+
+    fn read_process_ids(&mut self) {
+        let line = self.read_line();
         assert!(
             !line.is_empty(),
             "command exited before reporting its process tree"
@@ -134,6 +142,66 @@ time.sleep(60)
             "managed process {pid} was not reaped"
         );
     }
+    managed.descendants.clear();
+}
+
+fn signal_recording_command(exit_on_interrupt: bool) -> ManagedChild {
+    let mut command = nsproxy("direct");
+    command.env(
+        "NSPROXY_TEST_EXIT_ON_INTERRUPT",
+        if exit_on_interrupt { "1" } else { "0" },
+    );
+    let mut managed = ManagedChild::spawn_with_command(
+        command,
+        r#"
+import os, signal, sys
+received = []
+def handle(signum, frame):
+    name = signal.Signals(signum).name
+    received.append(name)
+    print(name, flush=True)
+    if signum == signal.SIGINT and os.environ['NSPROXY_TEST_EXIT_ON_INTERRUPT'] == '1':
+        sys.exit(0 if received == ['SIGTERM', 'SIGINT'] else 1)
+signal.signal(signal.SIGTERM, handle)
+signal.signal(signal.SIGINT, handle)
+print(os.getppid(), os.getpid(), flush=True)
+while True:
+    signal.pause()
+"#,
+    );
+    managed.read_process_ids();
+    managed
+}
+
+#[test]
+#[ignore = "requires Linux namespaces, /dev/net/tun, and Python 3"]
+fn sigint_after_sigterm_reaches_the_command_as_sigint() {
+    let mut managed = signal_recording_command(true);
+    let parent = Pid::from_raw(managed.child.id() as i32);
+    kill(parent, Signal::SIGTERM).unwrap();
+    assert_eq!(managed.read_line(), "SIGTERM");
+    kill(parent, Signal::SIGINT).unwrap();
+    assert_eq!(managed.read_line(), "SIGINT");
+    assert!(managed.wait().success());
+    managed.descendants.clear();
+}
+
+#[test]
+#[ignore = "requires Linux namespaces, /dev/net/tun, and Python 3"]
+fn later_termination_signals_preserve_the_first_grace_deadline() {
+    let mut managed = signal_recording_command(false);
+    let parent = Pid::from_raw(managed.child.id() as i32);
+    kill(parent, Signal::SIGTERM).unwrap();
+    assert_eq!(managed.read_line(), "SIGTERM");
+    std::thread::sleep(Duration::from_millis(1500));
+    let second_signal = Instant::now();
+    kill(parent, Signal::SIGINT).unwrap();
+    assert_eq!(managed.read_line(), "SIGINT");
+    assert_eq!(managed.wait().code(), Some(137));
+    assert!(
+        second_signal.elapsed() < Duration::from_millis(1500),
+        "later signals must not restart the two-second grace period"
+    );
     managed.descendants.clear();
 }
 

@@ -145,7 +145,10 @@ fn wait_for_command_tree(command_pid: Pid, signals: &SigSet) -> Result<i32> {
         }
         let signal = Signal::try_from(received)?;
         if signal != Signal::SIGCHLD {
-            termination.get_or_insert((signal, Instant::now() + TERMINATION_GRACE));
+            // Preserve the first deadline, but forward the signal just received.
+            let (last_signal, _) =
+                termination.get_or_insert((signal, Instant::now() + TERMINATION_GRACE));
+            *last_signal = signal;
         }
     }
 }

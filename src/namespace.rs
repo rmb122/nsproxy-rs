@@ -629,7 +629,7 @@ mod tun_tests {
                 .add(libc::IF_NAMESIZE)
                 .cast::<libc::c_short>()
                 .write_unaligned((IFF_TUN | IFF_NO_PI) as libc::c_short);
-            let result = libc::ioctl(file.as_raw_fd(), TUNSETIFF, buffer);
+            let result = libc::ioctl(file.as_raw_fd(), TUNSETIFF as _, buffer);
             let error = std::io::Error::last_os_error();
             libc::munmap(mapping, page_size * 2);
             assert_eq!(result, 0, "TUNSETIFF rejected the request: {error}");
