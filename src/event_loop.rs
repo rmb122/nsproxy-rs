@@ -4,6 +4,8 @@
 mod dns;
 mod outbound;
 mod published;
+#[cfg(test)]
+mod tcp_tests;
 
 use std::os::unix::io::{AsRawFd, RawFd};
 use std::task::Poll;
@@ -168,7 +170,11 @@ impl EventLoop {
 pub(super) fn new_tcp_socket() -> tcp::Socket<'static> {
     let rx_buf = tcp::SocketBuffer::new(vec![0u8; TCP_BUF_SIZE]);
     let tx_buf = tcp::SocketBuffer::new(vec![0u8; TCP_BUF_SIZE]);
-    tcp::Socket::new(rx_buf, tx_buf)
+    let mut socket = tcp::Socket::new(rx_buf, tx_buf);
+    // A large MSS leaves a short tail in our buffer. Send it without waiting
+    // for the application's delayed ACK of the preceding full segment.
+    socket.set_nagle_enabled(false);
+    socket
 }
 
 fn rand_seed() -> u64 {
