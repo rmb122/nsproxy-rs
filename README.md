@@ -1,5 +1,4 @@
-nsproxy-rs
-==========
+# nsproxy-rs
 
 nsproxy-rs is a Linux command-line tool that forces applications to use a
 specified SOCKS5 or HTTP proxy, using network namespaces for transparent
@@ -11,9 +10,28 @@ server. DNS queries are intercepted locally using a fake-IP scheme (similar to
 proxychains-ng), which prevents DNS leaks by sending domain names directly to
 the proxy for remote resolution.
 
+## Choosing between scproxy and nsproxy-rs
 
-How it works
-------------
+[scproxy](https://github.com/rmb122/scproxy) is a related tool that uses seccomp
+user notifications to redirect connections while keeping TCP processing in the
+kernel. Both projects support SOCKS5 and HTTP CONNECT proxies and work with
+statically linked programs.
+
+| Consideration       | scproxy                                                      | nsproxy-rs                                                       |
+| ------------------- | ------------------------------------------------------------ | ---------------------------------------------------------------- |
+| Performance         | Higher forwarding performance with native kernel TCP         | More overhead from TUN and user-space TCP/IP processing          |
+| Linux compatibility | Requires Linux 5.14+ and the required seccomp/pidfd features | Broader support for older kernels with namespaces and TUN        |
+| Isolation           | Inherits existing namespaces and uses host networking        | Stronger isolation through separate network and mount namespaces |
+
+Choose **scproxy** when performance is the priority and your system meets its
+kernel and permission requirements. Choose **nsproxy-rs** when compatibility
+with older kernels or namespace isolation matters more, or when you need file
+bind mounts and explicit TCP port publishing. nsproxy-rs requires namespace
+support and `/dev/net/tun`; its optional file bind mounts require Linux 5.2+.
+See each project's requirements and limitations to choose the best fit for your
+environment.
+
+## How it works
 
 1. Fork a child process into a new network namespace (with user namespace
    fallback for unprivileged users).
@@ -31,9 +49,7 @@ How it works
 7. Published host TCP ports are accepted by the parent and connected directly
    to the namespace-side TUN address through smoltcp.
 
-
-Features
---------
+## Features
 
 - Supports SOCKS5 and HTTP CONNECT proxy protocols.
 - Supports proxy authentication (username/password).
@@ -43,11 +59,11 @@ Features
 - Supports publishing host TCP ports to services inside the namespace.
 - Does not affect other processes on the system.
 
+## Build
 
-Build
------
-
-    cargo build --release
+```sh
+cargo build --release
+```
 
 The binary will be at `target/release/nsproxy`.
 
@@ -55,35 +71,37 @@ Run unit tests with `cargo test`. To also run the Linux integration tests on a
 host with user, network, and mount namespace support, `/dev/net/tun`, and
 Python 3, run `cargo test -- --ignored --test-threads=1`.
 
+## Usage
 
-Usage
------
+```text
+nsproxy [OPTIONS] <COMMAND>...
 
-    nsproxy [OPTIONS] <COMMAND>...
+Options:
+  -x, --proxy <PROXY>  Default route
+  -r, --rule <RULE>    Routing rule (repeatable); see "Routing rules" below
+  -b, --bind <SRC:DST> Bind-mount a file in the namespace (repeatable)
+  -p, --publish <SPEC> Publish a host TCP port to the namespace (repeatable)
+  -v, --verbose        Enable log output; repeat for trace-level logs
+  -h, --help           Print help
 
-    Options:
-      -x, --proxy <PROXY>  Default route
-      -r, --rule <RULE>    Routing rule (repeatable); see "Routing rules" below
-      -b, --bind <SRC:DST> Bind-mount a file in the namespace (repeatable)
-      -p, --publish <SPEC> Publish a host TCP port to the namespace (repeatable)
-      -v, --verbose        Enable log output; repeat for trace-level logs
-      -h, --help           Print help
+Proxy format:
+  direct
+  socks5://[user:pass@]host:port
+  http://[user:pass@]host:port
+```
 
-    Proxy format:
-      direct
-      socks5://[user:pass@]host:port
-      http://[user:pass@]host:port
+### Examples
 
-    Examples:
-      nsproxy -x socks5://127.0.0.1:1080 curl http://example.com
-      nsproxy -x socks5://127.0.0.1:1080 curl http://example.com
-      nsproxy -x http://user:pass@proxy:8080 wget http://example.com
-      nsproxy -x direct -r domain:example.com=socks5://127.0.0.1:1080 curl http://example.com
-      nsproxy -x direct -b ./custom.conf:/etc/example.conf cat /etc/example.conf
-      nsproxy -x direct -p 8080:80 web-server --listen 0.0.0.0:80
-      nsproxy -x direct -p 127.0.0.1:8443:443/tcp web-server --listen 0.0.0.0:443
-      nsproxy -x socks5://127.0.0.1:1080 ssh user@remote-host
-      nsproxy -x socks5://127.0.0.1:1080 -r cidr:10.0.0.0/8=direct curl http://internal
+```sh
+nsproxy -x socks5://127.0.0.1:1080 curl http://example.com
+nsproxy -x http://user:pass@proxy:8080 wget http://example.com
+nsproxy -x direct -r domain:example.com=socks5://127.0.0.1:1080 curl http://example.com
+nsproxy -x direct -b ./custom.conf:/etc/example.conf cat /etc/example.conf
+nsproxy -x direct -p 8080:80 web-server --listen 0.0.0.0:80
+nsproxy -x direct -p 127.0.0.1:8443:443/tcp web-server --listen 0.0.0.0:443
+nsproxy -x socks5://127.0.0.1:1080 ssh user@remote-host
+nsproxy -x socks5://127.0.0.1:1080 -r cidr:10.0.0.0/8=direct curl http://internal
+```
 
 Proxy server hostnames are resolved using the host's resolver. The 32-second
 connection timeout covers proxy hostname resolution, TCP connection setup,
@@ -94,24 +112,26 @@ reaper waits for descendants to exit and forces termination after a two-second
 grace period if necessary. Each subsequent termination signal is forwarded as
 received without extending the original grace period.
 
-
-Routing rules
--------------
+## Routing rules
 
 Connections that match a `--rule` (`-r`) rule use the route on the right side
 instead of the default selected by `-x`. The flag is repeatable, and both a
 match and a route are required:
 
-      ip:<address>=<proxy>
-      cidr:<network>/<prefix>=<proxy>
-      domain:<host>=<proxy>
-      domain-regex:<regex>=<proxy>
+```text
+ip:<address>=<proxy>
+cidr:<network>/<prefix>=<proxy>
+domain:<host>=<proxy>
+domain-regex:<regex>=<proxy>
+```
 
 For example:
 
-      -r ip:1.1.1.1=socks5://127.0.0.1:1081
-      -r cidr:10.0.0.0/8=direct
-      -r domain:example.com=http://127.0.0.1:8080
+```text
+-r ip:1.1.1.1=socks5://127.0.0.1:1081
+-r cidr:10.0.0.0/8=direct
+-r domain:example.com=http://127.0.0.1:8080
+```
 
 IP and CIDR rules use longest-prefix matching; the first rule wins when two
 matching prefixes have the same length. Domain and domain-regex rules use the
@@ -126,20 +146,22 @@ Notes:
 - A `direct` domain route uses the host's resolver, so it opts in to host-side
   DNS resolution for that domain.
 
-
-File bind mounts
-----------------
+## File bind mounts
 
 Use repeatable `--bind` (`-b`) options before the command to expose custom
 files inside the command's mount namespace:
 
-      nsproxy -x direct -b ./config.toml:/etc/myapp/config.toml myapp
+```sh
+nsproxy -x direct -b ./config.toml:/etc/myapp/config.toml myapp
+```
 
 For example, create a symbolic link for the US Eastern time zone and mount the
 link over the existing `/etc/localtime` when running `date`:
 
-      ln -s /usr/share/zoneinfo/America/New_York ./new-york-localtime
-      nsproxy -x direct -b ./new-york-localtime:/etc/localtime date
+```sh
+ln -s /usr/share/zoneinfo/America/New_York ./new-york-localtime
+nsproxy -x direct -b ./new-york-localtime:/etc/localtime date
+```
 
 Both paths may be relative to the directory where nsproxy is started. Each
 path must name either a regular file or a symbolic link; dangling symbolic
@@ -150,18 +172,20 @@ read-write; directories and Docker-style mode suffixes such as `:ro` are not
 supported. Duplicate targets and the internal DNS mount targets
 `/etc/resolv.conf` and `/etc/nsswitch.conf` are rejected.
 
-
-TCP port publishing
--------------------
+## TCP port publishing
 
 Use repeatable `--publish` (`-p`) options before the command to expose TCP
 services running inside the network namespace:
 
-      [HOST_IP:]HOST_PORT:NS_PORT[/tcp]
+```text
+[HOST_IP:]HOST_PORT:NS_PORT[/tcp]
+```
 
 For example:
 
-      nsproxy -x direct -p 127.0.0.1:8080:80/tcp server --listen 0.0.0.0:80
+```sh
+nsproxy -x direct -p 127.0.0.1:8080:80/tcp server --listen 0.0.0.0:80
+```
 
 `HOST_IP` defaults to `0.0.0.0`, which exposes the port on every host IPv4
 interface. The `/tcp` suffix is optional. UDP, IPv6 addresses, random host
@@ -173,20 +197,18 @@ reached. Published connections bypass proxy and routing rules. The service sees
 the source as the TUN gateway `172.23.255.254`, not as the external client's
 original address.
 
-
-Requirements
-------------
+## Requirements
 
 - Linux kernel with user namespace support.
 - File bind mounts (`-b` / `--bind`) require Linux >= 5.2. Other features do
   not use this newer mount API.
 - On Ubuntu >= 23.10, you may need to disable the AppArmor restriction:
 
-      sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+  ```sh
+  sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+  ```
 
-
-Limitations
------------
+## Limitations
 
 - TCP only (UDP forwarding is not implemented).
 - IPv4 only.
@@ -195,9 +217,7 @@ Limitations
 - Connections to loopback addresses refer to the namespace, not the host.
 - `sudo` and `su` will not work inside the namespace (only one UID is mapped).
 
-
-Credits
--------
+## Credits
 
 This project is a Rust reimplementation inspired by
 [nsproxy](https://github.com/nlzy/nsproxy) by NaLan ZeYu. The original C
