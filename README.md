@@ -10,27 +10,6 @@ server. DNS queries are intercepted locally using a fake-IP scheme (similar to
 proxychains-ng), which prevents DNS leaks by sending domain names directly to
 the proxy for remote resolution.
 
-## Choosing between scproxy and nsproxy-rs
-
-[scproxy](https://github.com/rmb122/scproxy) is a related tool that uses seccomp
-user notifications to redirect connections while keeping TCP processing in the
-kernel. Both projects support SOCKS5 and HTTP CONNECT proxies and work with
-statically linked programs.
-
-| Consideration       | scproxy                                                      | nsproxy-rs                                                       |
-| ------------------- | ------------------------------------------------------------ | ---------------------------------------------------------------- |
-| Performance         | Higher forwarding performance with native kernel TCP         | More overhead from TUN and user-space TCP/IP processing          |
-| Linux compatibility | Requires Linux 5.14+ and the required seccomp/pidfd features | Broader support for older kernels with namespaces and TUN        |
-| Isolation           | Inherits existing namespaces and uses host networking        | Stronger isolation through separate network and mount namespaces |
-
-Choose **scproxy** when performance is the priority and your system meets its
-kernel and permission requirements. Choose **nsproxy-rs** when compatibility
-with older kernels or namespace isolation matters more, or when you need file
-bind mounts and explicit TCP port publishing. nsproxy-rs requires namespace
-support and `/dev/net/tun`; its optional file bind mounts require Linux 5.2+.
-See each project's requirements and limitations to choose the best fit for your
-environment.
-
 ## How it works
 
 1. Fork a child process into a new network namespace (with user namespace
@@ -223,3 +202,24 @@ This project is a Rust reimplementation inspired by
 [nsproxy](https://github.com/nlzy/nsproxy) by NaLan ZeYu. The original C
 implementation uses lwIP as its user-space TCP/IP stack and forwards DNS to a
 real server; this version uses smoltcp and a fake-DNS approach instead.
+
+## Choosing between scproxy and nsproxy-rs
+
+[scproxy](https://github.com/rmb122/scproxy) is a related tool that uses seccomp
+user notifications to redirect connections while keeping TCP processing in the
+kernel. Both projects support SOCKS5 and HTTP CONNECT proxies and work with
+statically linked programs.
+
+| Consideration       | scproxy                                                      | nsproxy-rs                                                       |
+| ------------------- | ------------------------------------------------------------ | ---------------------------------------------------------------- |
+| Performance         | Higher forwarding performance with native kernel TCP         | More overhead from TUN and user-space TCP/IP processing          |
+| Linux compatibility | Requires Linux 5.14+ and the required seccomp/pidfd features | Broader support for older kernels with namespaces and TUN        |
+| Isolation           | Inherits existing namespaces and uses host networking        | Stronger isolation through separate network and mount namespaces |
+
+Choose **scproxy** when performance is the priority and your system meets its
+kernel and permission requirements. Choose **nsproxy-rs** when compatibility
+with older kernels or namespace isolation matters more, or when you need file
+bind mounts and explicit TCP port publishing. nsproxy-rs requires namespace
+support and `/dev/net/tun`; its optional file bind mounts require Linux 5.2+.
+See each project's requirements and limitations to choose the best fit for your
+environment.
